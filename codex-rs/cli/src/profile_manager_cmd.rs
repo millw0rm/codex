@@ -235,6 +235,7 @@ pub fn prepare_best_profile_launch(
         .into_iter()
         .map(|profile| ProfileAuthCandidateConfig {
             auth_file: root.profile_home(&profile.name).join("auth.json"),
+            limit_file: Some(root.limit_file(&profile.name)),
             name: profile.name,
         })
         .collect();

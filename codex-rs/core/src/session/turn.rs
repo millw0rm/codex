@@ -1141,7 +1141,7 @@ async fn run_sampling_request(
                 }
                 if let Some(profile_auth_failover) = sess.services.profile_auth_failover.as_ref() {
                     match profile_auth_failover
-                        .switch_after_usage_limit(&sess.services.auth_manager)
+                        .switch_after_usage_limit(&sess.services.auth_manager, &e)
                         .await
                     {
                         Ok(Some(profile)) => {

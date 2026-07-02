@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 const NEAR_LIMIT_PERCENT: f64 = 90.0;
 const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
+const LIMITED_CACHE_FALLBACK_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +49,8 @@ pub(super) struct LimitReport {
 struct UsageWindow {
     used_percent: f64,
     window_minutes: Option<i64>,
+    reset_after_seconds: Option<i64>,
+    resets_at: Option<u64>,
     is_secondary: bool,
 }
 
@@ -132,10 +135,12 @@ fn limit_cache_or_fetch(
     refresh: bool,
 ) -> anyhow::Result<(LimitCache, String)> {
     let cache_path = root.limit_file(name);
-    if !refresh && cache_path.is_file() {
+    if cache_path.is_file() {
         let contents = fs::read_to_string(&cache_path)?;
         let cache: LimitCache = serde_json::from_str(&contents)?;
-        if cached_account_matches_auth(&cache.account_id, auth) {
+        if cached_account_matches_auth(&cache.account_id, auth)
+            && (!refresh || limited_cache_still_blocks_refresh(&cache, unix_now()))
+        {
             return Ok((cache, "cache".to_string()));
         }
     }
@@ -182,13 +187,20 @@ fn fetch_limits(auth: &AuthSummary) -> anyhow::Result<LimitCache> {
 }
 
 fn report_from_cache(name: &str, cache: LimitCache, source: String) -> LimitReport {
+    let detail = if let Some(skip_until) =
+        limited_cache_skip_until(cache.status, &cache.payload, cache.observed_at)
+    {
+        format!("observed={} limited_until={skip_until}", cache.observed_at)
+    } else {
+        format!("observed={}", cache.observed_at)
+    };
     LimitReport {
         name: name.to_string(),
         status: cache.status,
         five_hour_percent: labeled_window_percent(&cache.payload, WindowLabel::FiveHour),
         weekly_percent: labeled_window_percent(&cache.payload, WindowLabel::Weekly),
         source,
-        detail: format!("observed={}", cache.observed_at),
+        detail,
     }
 }
 
@@ -245,10 +257,24 @@ fn usage_window(payload: &Value, name: &str, is_secondary: bool) -> Option<Usage
         .and_then(Value::as_f64)?;
     let window_minutes = payload
         .pointer(&format!("/rate_limit/{name}/window_minutes"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            payload
+                .pointer(&format!("/rate_limit/{name}/limit_window_seconds"))
+                .and_then(Value::as_i64)
+                .map(|seconds| seconds / 60)
+        });
+    let reset_after_seconds = payload
+        .pointer(&format!("/rate_limit/{name}/reset_after_seconds"))
         .and_then(Value::as_i64);
+    let resets_at = payload
+        .pointer(&format!("/rate_limit/{name}/reset_at"))
+        .and_then(Value::as_u64);
     Some(UsageWindow {
         used_percent,
         window_minutes,
+        reset_after_seconds,
+        resets_at,
         is_secondary,
     })
 }
@@ -307,6 +333,44 @@ fn limit_score(report: &LimitReport) -> f64 {
         .five_hour_percent
         .unwrap_or(100.0)
         .max(report.weekly_percent.unwrap_or(100.0))
+}
+
+fn limited_cache_still_blocks_refresh(cache: &LimitCache, now: u64) -> bool {
+    limited_cache_skip_until(cache.status, &cache.payload, cache.observed_at)
+        .is_some_and(|skip_until| skip_until > now)
+}
+
+pub(super) fn limited_cache_skip_until(
+    status: LimitStatus,
+    payload: &Value,
+    observed_at: u64,
+) -> Option<u64> {
+    if status != LimitStatus::Limited {
+        return None;
+    }
+    let windows = usage_windows(payload);
+    let capped_resets = windows
+        .iter()
+        .filter(|window| window.used_percent >= 100.0)
+        .filter_map(|window| window_reset_at(window, observed_at))
+        .collect::<Vec<_>>();
+    if !capped_resets.is_empty() {
+        return capped_resets.into_iter().max();
+    }
+    windows
+        .iter()
+        .filter_map(|window| window_reset_at(window, observed_at))
+        .min()
+        .or_else(|| Some(observed_at.saturating_add(LIMITED_CACHE_FALLBACK_SECONDS)))
+}
+
+fn window_reset_at(window: &UsageWindow, observed_at: u64) -> Option<u64> {
+    window.resets_at.or_else(|| {
+        window
+            .reset_after_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map(|seconds| observed_at.saturating_add(seconds))
+    })
 }
 
 pub(super) fn print_limits(reports: &[LimitReport]) {

@@ -216,6 +216,35 @@ fn best_profile_penalizes_weekly_usage() -> anyhow::Result<()> {
 }
 
 #[test]
+fn limited_cache_skip_until_uses_window_reset_time() {
+    let payload = serde_json::json!({
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 100,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 7200,
+                "reset_at": 200,
+            },
+            "secondary_window": {
+                "used_percent": 97,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 300000,
+                "reset_at": 500,
+            },
+        },
+    });
+
+    assert_eq!(
+        limits::limited_cache_skip_until(LimitStatus::Limited, &payload, /*observed_at*/ 100),
+        Some(200)
+    );
+    assert_eq!(
+        limits::limited_cache_skip_until(LimitStatus::Ok, &payload, /*observed_at*/ 100),
+        None
+    );
+}
+
+#[test]
 fn cached_limit_account_must_match_current_auth() {
     let auth = auth::AuthSummary {
         mode: codex_protocol::auth::AuthMode::Chatgpt,

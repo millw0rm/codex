@@ -609,6 +609,7 @@ pub enum ThreadStoreConfig {
 pub struct ProfileAuthCandidateConfig {
     pub name: String,
     pub auth_file: PathBuf,
+    pub limit_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
