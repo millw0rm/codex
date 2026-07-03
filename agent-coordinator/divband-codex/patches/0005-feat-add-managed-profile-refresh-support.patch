@@ -1,0 +1,3120 @@
+From 12986f5ec6756d1bdb58a1f9c117663df4b1a12e Mon Sep 17 00:00:00 2001
+From: your name <you@exampl.ecom>
+Date: Fri, 3 Jul 2026 10:29:55 +0330
+Subject: [PATCH 5/7] feat: add managed profile refresh support
+
+---
+ .../schema/json/ClientRequest.json            |  35 ++
+ .../codex_app_server_protocol.schemas.json    |  42 ++
+ .../codex_app_server_protocol.v2.schemas.json |  42 ++
+ .../json/v2/ThreadProfileRefreshParams.json   |  13 +
+ .../json/v2/ThreadProfileRefreshResponse.json |   5 +
+ .../schema/typescript/ClientRequest.ts        |   3 +-
+ .../v2/ThreadProfileRefreshParams.ts          |   5 +
+ .../v2/ThreadProfileRefreshResponse.ts        |   5 +
+ .../schema/typescript/v2/index.ts             |   2 +
+ .../src/protocol/common.rs                    |   5 +
+ .../src/protocol/v2/thread.rs                 |  12 +
+ codex-rs/app-server/README.md                 |   1 +
+ codex-rs/app-server/src/message_processor.rs  |   5 +
+ codex-rs/app-server/src/request_processors.rs |   2 +
+ .../request_processors/thread_processor.rs    |  24 +
+ codex-rs/app-server/tests/suite/v2/mod.rs     |   1 +
+ .../tests/suite/v2/thread_profile_refresh.rs  |  74 +++
+ codex-rs/cli/README.md                        |  48 ++
+ codex-rs/cli/src/main.rs                      | 197 +++++++-
+ codex-rs/cli/src/profile_manager_cmd.rs       |  11 +-
+ codex-rs/cli/src/profile_manager_cmd_tests.rs |   1 +
+ codex-rs/core/src/session/handlers.rs         |  38 ++
+ codex-rs/core/src/session/managed_profiles.rs | 477 ++++++++++++++++++
+ .../src/session/managed_profiles_tests.rs     |  49 ++
+ codex-rs/core/src/session/mod.rs              |   1 +
+ .../core/src/session/profile_auth_failover.rs |  20 +-
+ .../session/profile_auth_failover_tests.rs    |  95 ++++
+ codex-rs/core/tests/common/test_codex.rs      |  99 ++--
+ codex-rs/core/tests/suite/mod.rs              |   1 +
+ .../core/tests/suite/profile_auth_failover.rs | 120 +++++
+ codex-rs/exec/src/cli.rs                      |   5 +
+ codex-rs/exec/src/cli_tests.rs                |  33 ++
+ codex-rs/exec/src/lib.rs                      |  38 +-
+ codex-rs/protocol/src/protocol.rs             |   7 +
+ codex-rs/tui/src/app/thread_routing.rs        |   4 +
+ codex-rs/tui/src/app_command.rs               |   5 +
+ codex-rs/tui/src/app_server_session.rs        |  17 +
+ .../tui/src/bottom_pane/slash_commands.rs     |   1 +
+ codex-rs/tui/src/chatwidget/slash_dispatch.rs |   4 +
+ .../src/chatwidget/tests/slash_commands.rs    |  12 +
+ codex-rs/tui/src/lib.rs                       |  51 +-
+ codex-rs/tui/src/session_archive_commands.rs  |  38 +-
+ codex-rs/tui/src/slash_command.rs             |  20 +
+ codex-rs/utils/cli/src/lib.rs                 |  12 +
+ .../utils/cli/src/model_provider_shortcuts.rs |  59 +++
+ .../cli/src/model_provider_shortcuts_tests.rs |  78 +++
+ codex-rs/utils/cli/src/project_home.rs        | 198 ++++++++
+ codex-rs/utils/cli/src/project_home_tests.rs  | 114 +++++
+ codex-rs/utils/cli/src/shared_options.rs      |  46 +-
+ 49 files changed, 2090 insertions(+), 85 deletions(-)
+ create mode 100644 codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshParams.json
+ create mode 100644 codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshResponse.json
+ create mode 100644 codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshParams.ts
+ create mode 100644 codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshResponse.ts
+ create mode 100644 codex-rs/app-server/tests/suite/v2/thread_profile_refresh.rs
+ create mode 100644 codex-rs/cli/README.md
+ create mode 100644 codex-rs/core/src/session/managed_profiles.rs
+ create mode 100644 codex-rs/core/src/session/managed_profiles_tests.rs
+ create mode 100644 codex-rs/core/tests/suite/profile_auth_failover.rs
+ create mode 100644 codex-rs/utils/cli/src/model_provider_shortcuts.rs
+ create mode 100644 codex-rs/utils/cli/src/model_provider_shortcuts_tests.rs
+ create mode 100644 codex-rs/utils/cli/src/project_home.rs
+ create mode 100644 codex-rs/utils/cli/src/project_home_tests.rs
+
+diff --git a/codex-rs/app-server-protocol/schema/json/ClientRequest.json b/codex-rs/app-server-protocol/schema/json/ClientRequest.json
+index f3983e31..bac5b5af 100644
+--- a/codex-rs/app-server-protocol/schema/json/ClientRequest.json
++++ b/codex-rs/app-server-protocol/schema/json/ClientRequest.json
+@@ -3965,6 +3965,17 @@
+       ],
+       "type": "object"
+     },
++    "ThreadProfileRefreshParams": {
++      "properties": {
++        "threadId": {
++          "type": "string"
++        }
++      },
++      "required": [
++        "threadId"
++      ],
++      "type": "object"
++    },
+     "ThreadReadParams": {
+       "properties": {
+         "includeTurns": {
+@@ -5152,6 +5163,30 @@
+       "title": "Thread/shellCommandRequest",
+       "type": "object"
+     },
++    {
++      "properties": {
++        "id": {
++          "$ref": "#/definitions/RequestId"
++        },
++        "method": {
++          "enum": [
++            "thread/profile/refresh"
++          ],
++          "title": "Thread/profile/refreshRequestMethod",
++          "type": "string"
++        },
++        "params": {
++          "$ref": "#/definitions/ThreadProfileRefreshParams"
++        }
++      },
++      "required": [
++        "id",
++        "method",
++        "params"
++      ],
++      "title": "Thread/profile/refreshRequest",
++      "type": "object"
++    },
+     {
+       "properties": {
+         "id": {
+diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+index b77b512b..8e52619e 100644
+--- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
++++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+@@ -564,6 +564,30 @@
+           "title": "Thread/shellCommandRequest",
+           "type": "object"
+         },
++        {
++          "properties": {
++            "id": {
++              "$ref": "#/definitions/v2/RequestId"
++            },
++            "method": {
++              "enum": [
++                "thread/profile/refresh"
++              ],
++              "title": "Thread/profile/refreshRequestMethod",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/definitions/v2/ThreadProfileRefreshParams"
++            }
++          },
++          "required": [
++            "id",
++            "method",
++            "params"
++          ],
++          "title": "Thread/profile/refreshRequest",
++          "type": "object"
++        },
+         {
+           "properties": {
+             "id": {
+@@ -18659,6 +18683,24 @@
+         "title": "ThreadNameUpdatedNotification",
+         "type": "object"
+       },
++      "ThreadProfileRefreshParams": {
++        "$schema": "http://json-schema.org/draft-07/schema#",
++        "properties": {
++          "threadId": {
++            "type": "string"
++          }
++        },
++        "required": [
++          "threadId"
++        ],
++        "title": "ThreadProfileRefreshParams",
++        "type": "object"
++      },
++      "ThreadProfileRefreshResponse": {
++        "$schema": "http://json-schema.org/draft-07/schema#",
++        "title": "ThreadProfileRefreshResponse",
++        "type": "object"
++      },
+       "ThreadReadParams": {
+         "$schema": "http://json-schema.org/draft-07/schema#",
+         "properties": {
+diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
+index bdd61d6b..79574a4e 100644
+--- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
++++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
+@@ -1594,6 +1594,30 @@
+           "title": "Thread/shellCommandRequest",
+           "type": "object"
+         },
++        {
++          "properties": {
++            "id": {
++              "$ref": "#/definitions/RequestId"
++            },
++            "method": {
++              "enum": [
++                "thread/profile/refresh"
++              ],
++              "title": "Thread/profile/refreshRequestMethod",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/definitions/ThreadProfileRefreshParams"
++            }
++          },
++          "required": [
++            "id",
++            "method",
++            "params"
++          ],
++          "title": "Thread/profile/refreshRequest",
++          "type": "object"
++        },
+         {
+           "properties": {
+             "id": {
+@@ -16438,6 +16462,24 @@
+       "title": "ThreadNameUpdatedNotification",
+       "type": "object"
+     },
++    "ThreadProfileRefreshParams": {
++      "$schema": "http://json-schema.org/draft-07/schema#",
++      "properties": {
++        "threadId": {
++          "type": "string"
++        }
++      },
++      "required": [
++        "threadId"
++      ],
++      "title": "ThreadProfileRefreshParams",
++      "type": "object"
++    },
++    "ThreadProfileRefreshResponse": {
++      "$schema": "http://json-schema.org/draft-07/schema#",
++      "title": "ThreadProfileRefreshResponse",
++      "type": "object"
++    },
+     "ThreadReadParams": {
+       "$schema": "http://json-schema.org/draft-07/schema#",
+       "properties": {
+diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshParams.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshParams.json
+new file mode 100644
+index 00000000..6f5f479f
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshParams.json
+@@ -0,0 +1,13 @@
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "properties": {
++    "threadId": {
++      "type": "string"
++    }
++  },
++  "required": [
++    "threadId"
++  ],
++  "title": "ThreadProfileRefreshParams",
++  "type": "object"
++}
+\ No newline at end of file
+diff --git a/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshResponse.json b/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshResponse.json
+new file mode 100644
+index 00000000..ed6db98b
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/json/v2/ThreadProfileRefreshResponse.json
+@@ -0,0 +1,5 @@
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "ThreadProfileRefreshResponse",
++  "type": "object"
++}
+\ No newline at end of file
+diff --git a/codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts b/codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts
+index 6af04ef4..32e1ad91 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts
+@@ -72,6 +72,7 @@ import type { ThreadInjectItemsParams } from "./v2/ThreadInjectItemsParams";
+ import type { ThreadListParams } from "./v2/ThreadListParams";
+ import type { ThreadLoadedListParams } from "./v2/ThreadLoadedListParams";
+ import type { ThreadMetadataUpdateParams } from "./v2/ThreadMetadataUpdateParams";
++import type { ThreadProfileRefreshParams } from "./v2/ThreadProfileRefreshParams";
+ import type { ThreadReadParams } from "./v2/ThreadReadParams";
+ import type { ThreadResumeParams } from "./v2/ThreadResumeParams";
+ import type { ThreadRollbackParams } from "./v2/ThreadRollbackParams";
+@@ -88,4 +89,4 @@ import type { WindowsSandboxSetupStartParams } from "./v2/WindowsSandboxSetupSta
+ /**
+  * Request from the client to the server.
+  */
+-export type ClientRequest ={ "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/rollback", id: RequestId, params: ThreadRollbackParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params: undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params: undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, };
++export type ClientRequest ={ "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/profile/refresh", id: RequestId, params: ThreadProfileRefreshParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/rollback", id: RequestId, params: ThreadRollbackParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params: undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params: undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, };
+diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshParams.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshParams.ts
+new file mode 100644
+index 00000000..3b7bf71e
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshParams.ts
+@@ -0,0 +1,5 @@
++// GENERATED CODE! DO NOT MODIFY BY HAND!
++
++// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
++
++export type ThreadProfileRefreshParams = { threadId: string, };
+diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshResponse.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshResponse.ts
+new file mode 100644
+index 00000000..0abb3a74
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/typescript/v2/ThreadProfileRefreshResponse.ts
+@@ -0,0 +1,5 @@
++// GENERATED CODE! DO NOT MODIFY BY HAND!
++
++// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
++
++export type ThreadProfileRefreshResponse = Record<string, never>;
+diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
+index c405082c..2faaa64d 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
+@@ -424,6 +424,8 @@ export type { ThreadMetadataGitInfoUpdateParams } from "./ThreadMetadataGitInfoU
+ export type { ThreadMetadataUpdateParams } from "./ThreadMetadataUpdateParams";
+ export type { ThreadMetadataUpdateResponse } from "./ThreadMetadataUpdateResponse";
+ export type { ThreadNameUpdatedNotification } from "./ThreadNameUpdatedNotification";
++export type { ThreadProfileRefreshParams } from "./ThreadProfileRefreshParams";
++export type { ThreadProfileRefreshResponse } from "./ThreadProfileRefreshResponse";
+ export type { ThreadReadParams } from "./ThreadReadParams";
+ export type { ThreadReadResponse } from "./ThreadReadResponse";
+ export type { ThreadRealtimeAudioChunk } from "./ThreadRealtimeAudioChunk";
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index d8db99d4..1c211efc 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -584,6 +584,11 @@ client_request_definitions! {
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadShellCommandResponse,
+     },
++    ThreadProfileRefresh => "thread/profile/refresh" {
++        params: v2::ThreadProfileRefreshParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadProfileRefreshResponse,
++    },
+     ThreadApproveGuardianDeniedAction => "thread/approveGuardianDeniedAction" {
+         params: v2::ThreadApproveGuardianDeniedActionParams,
+         serialization: thread_id(params.thread_id),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index 7cd03930..af0db163 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -988,6 +988,18 @@ pub struct ThreadBackgroundTerminalsCleanParams {
+ #[ts(export_to = "v2/")]
+ pub struct ThreadBackgroundTerminalsCleanResponse {}
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadProfileRefreshParams {
++    pub thread_id: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadProfileRefreshResponse {}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
+index c9ac2f5f..77659f31 100644
+--- a/codex-rs/app-server/README.md
++++ b/codex-rs/app-server/README.md
+@@ -164,6 +164,7 @@ Example with notification opt-out:
+ - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
+ - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
+ - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
++- `thread/profile/refresh` — switch a loaded thread to the next managed auth profile when the server was started from `codex --best`; returns `{}` immediately and emits a warning event describing the switch result. This swaps auth only and does not start a turn or mutate conversation context.
+ - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
+ - `thread/backgroundTerminals/list` — list running background terminals for a loaded thread (experimental; requires `capabilities.experimentalApi`); returns `data` with the running terminal ids.
+ - `thread/backgroundTerminals/terminate` — terminate one running background terminal by app-server `processId` (experimental; requires `capabilities.experimentalApi`); returns whether a process was terminated.
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 375307e8..924bca90 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1196,6 +1196,11 @@ impl MessageProcessor {
+                     .thread_background_terminals_clean(&request_id, params)
+                     .await
+             }
++            ClientRequest::ThreadProfileRefresh { params, .. } => {
++                self.thread_processor
++                    .thread_profile_refresh(&request_id, params)
++                    .await
++            }
+             ClientRequest::ThreadBackgroundTerminalsList { params, .. } => {
+                 self.thread_processor
+                     .thread_background_terminals_list(params)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 587325c2..3d9a21b6 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -229,6 +229,8 @@ use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+ use codex_app_server_protocol::ThreadMetadataUpdateParams;
+ use codex_app_server_protocol::ThreadMetadataUpdateResponse;
+ use codex_app_server_protocol::ThreadNameUpdatedNotification;
++use codex_app_server_protocol::ThreadProfileRefreshParams;
++use codex_app_server_protocol::ThreadProfileRefreshResponse;
+ use codex_app_server_protocol::ThreadReadParams;
+ use codex_app_server_protocol::ThreadReadResponse;
+ use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index b78c53a3..b3d185ba 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -723,6 +723,16 @@ impl ThreadRequestProcessor {
+             .map(|response| Some(response.into()))
+     }
+ 
++    pub(crate) async fn thread_profile_refresh(
++        &self,
++        request_id: &ConnectionRequestId,
++        params: ThreadProfileRefreshParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        self.thread_profile_refresh_inner(request_id, params)
++            .await
++            .map(|response| Some(response.into()))
++    }
++
+     pub(crate) async fn thread_approve_guardian_denied_action(
+         &self,
+         request_id: &ConnectionRequestId,
+@@ -1798,6 +1808,20 @@ impl ThreadRequestProcessor {
+         Ok(ThreadBackgroundTerminalsCleanResponse {})
+     }
+ 
++    async fn thread_profile_refresh_inner(
++        &self,
++        request_id: &ConnectionRequestId,
++        params: ThreadProfileRefreshParams,
++    ) -> Result<ThreadProfileRefreshResponse, JSONRPCErrorError> {
++        let ThreadProfileRefreshParams { thread_id } = params;
++
++        let (_, thread) = self.load_thread(&thread_id).await?;
++        self.submit_core_op(request_id, thread.as_ref(), Op::RefreshProfileAuth)
++            .await
++            .map_err(|err| internal_error(format!("failed to refresh profile auth: {err}")))?;
++        Ok(ThreadProfileRefreshResponse {})
++    }
++
+     async fn thread_background_terminals_list_inner(
+         &self,
+         params: ThreadBackgroundTerminalsListParams,
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+index bdb03271..2c8a1823 100644
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -71,6 +71,7 @@ mod thread_loaded_list;
+ mod thread_memory_mode_set;
+ mod thread_metadata_update;
+ mod thread_name_websocket;
++mod thread_profile_refresh;
+ mod thread_read;
+ mod thread_resume;
+ mod thread_rollback;
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_profile_refresh.rs b/codex-rs/app-server/tests/suite/v2/thread_profile_refresh.rs
+new file mode 100644
+index 00000000..6fbc144b
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/thread_profile_refresh.rs
+@@ -0,0 +1,74 @@
++use anyhow::Result;
++use app_test_support::TestAppServer;
++use app_test_support::to_response;
++use codex_app_server_protocol::JSONRPCResponse;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadProfileRefreshResponse;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadStartResponse;
++use codex_app_server_protocol::WarningNotification;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use tempfile::TempDir;
++use tokio::time::Duration;
++use tokio::time::timeout;
++
++const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
++
++#[tokio::test]
++async fn thread_profile_refresh_returns_response_and_warning_without_turn() -> Result<()> {
++    let codex_home = TempDir::new()?;
++    let mut mcp = TestAppServer::new_with_auto_env(codex_home.path()).await?;
++    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++
++    let thread_start_id = mcp
++        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
++        .await?;
++    let thread_start_resp: JSONRPCResponse = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
++    )
++    .await??;
++    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
++
++    let refresh_id = mcp
++        .send_raw_request(
++            "thread/profile/refresh",
++            Some(json!({ "threadId": thread.id.clone() })),
++        )
++        .await?;
++    let refresh_resp: JSONRPCResponse = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(refresh_id)),
++    )
++    .await??;
++    let _: ThreadProfileRefreshResponse = to_response(refresh_resp)?;
++
++    let warning = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("warning"),
++    )
++    .await??;
++    let warning: WarningNotification =
++        serde_json::from_value(warning.params.expect("warning params should be present"))?;
++    assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
++    assert!(
++        warning
++            .message
++            .contains("No managed profile failover is configured"),
++        "unexpected warning: {}",
++        warning.message
++    );
++
++    let turn_started = timeout(
++        Duration::from_millis(250),
++        mcp.read_stream_until_notification_message("turn/started"),
++    )
++    .await;
++    assert!(
++        turn_started.is_err(),
++        "profile refresh should not start a turn"
++    );
++
++    Ok(())
++}
+diff --git a/codex-rs/cli/README.md b/codex-rs/cli/README.md
+new file mode 100644
+index 00000000..625f3618
+--- /dev/null
++++ b/codex-rs/cli/README.md
+@@ -0,0 +1,48 @@
++# Codex CLI crate notes
++
++## Managed account profiles and `--best`
++
++This repository includes a local `codex-profiles` helper for managing multiple
++Codex account homes. A profile is just a named `CODEX_HOME` containing its own
++`auth.json`; `codex --best` only selects from profiles that already exist in
++that managed profile root.
++
++`codex --best` does not create or log in to a new profile when the active
++account reaches a usage limit. Before launching the interactive TUI it refreshes
++ChatGPT usage for the existing managed profiles, picks the usable profile with
++the lowest maximum usage across the 5-hour and weekly windows, copies that
++profile's `auth.json` into the project home, and configures runtime failover
++across the remaining usable candidates.
++
++Runtime failover can only switch to another candidate from that same launch. If
++the selected profile later returns a usage-limit error, Codex writes a limited
++cache entry for it, copies the next candidate's `auth.json` into the project
++home, reloads auth, and retries the turn. If there is no next candidate, the
++usage-limit error is returned to the user.
++
++While running a TUI session launched with `codex --best`, use
++`/refresh-profile` to manually switch to the next managed profile without
++starting a new turn. This keeps the current session and conversation context in
++place; it only swaps the project home's `auth.json` and reloads auth.
++
++Typical setup:
++
++```shell
++codex-profiles add main
++codex-profiles add backup
++codex --best
++```
++
++Useful inspection commands:
++
++```shell
++codex-profiles list
++codex-profiles limits --refresh
++codex-profiles best --refresh
++codex-profiles home backup
++```
++
++If `codex --best` still reports a usage limit, check that more than one managed
++profile exists and that at least one of them has remaining quota. To add another
++candidate, create or import a profile first; `--best` will not invent one from
++another ChatGPT account under the hood.
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 6608a76a..b8a5c614 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -1294,12 +1294,25 @@ async fn cli_main(
+                 include_non_interactive,
+                 config_overrides,
+             );
++            let InteractiveRemoteOptions {
++                remote,
++                remote_auth_token_env,
++            } = remote;
++            let remote = remote.or(root_remote.clone());
++            let remote_auth_token_env =
++                remote_auth_token_env.or(root_remote_auth_token_env.clone());
++            if interactive.best_profile {
++                reject_remote_mode_for_subcommand(
++                    remote.as_deref(),
++                    remote_auth_token_env.as_deref(),
++                    "resume --best",
++                )?;
++                configure_best_profile_launch(&mut interactive).await?;
++            }
+             let exit_info = run_interactive_tui(
+                 interactive,
+-                remote.remote.or(root_remote.clone()),
+-                remote
+-                    .remote_auth_token_env
+-                    .or(root_remote_auth_token_env.clone()),
++                remote,
++                remote_auth_token_env,
+                 arg0_paths.clone(),
+             )
+             .await?;
+@@ -1361,12 +1374,25 @@ async fn cli_main(
+                 all,
+                 config_overrides,
+             );
++            let InteractiveRemoteOptions {
++                remote,
++                remote_auth_token_env,
++            } = remote;
++            let remote = remote.or(root_remote.clone());
++            let remote_auth_token_env =
++                remote_auth_token_env.or(root_remote_auth_token_env.clone());
++            if interactive.best_profile {
++                reject_remote_mode_for_subcommand(
++                    remote.as_deref(),
++                    remote_auth_token_env.as_deref(),
++                    "fork --best",
++                )?;
++                configure_best_profile_launch(&mut interactive).await?;
++            }
+             let exit_info = run_interactive_tui(
+                 interactive,
+-                remote.remote.or(root_remote.clone()),
+-                remote
+-                    .remote_auth_token_env
+-                    .or(root_remote_auth_token_env.clone()),
++                remote,
++                remote_auth_token_env,
+                 arg0_paths.clone(),
+             )
+             .await?;
+@@ -1859,10 +1885,12 @@ async fn load_exec_server_config(
+ async fn configure_best_profile_launch(interactive: &mut TuiCli) -> anyhow::Result<()> {
+     eprintln!("Refreshing profile usage limits...");
+     let project_dir = interactive.cwd.clone();
++    let project_id = interactive.project.clone();
+     let launch = tokio::task::spawn_blocking(move || {
+         codex_cli::profile_manager_cmd::prepare_best_profile_launch(
+             /*root_dir*/ None,
+             project_dir.as_deref(),
++            project_id.as_deref(),
+             /*refresh_limits*/ true,
+         )
+     })
+@@ -1979,6 +2007,9 @@ async fn run_debug_prompt_input_command(
+     let mut cli_kv_overrides = root_config_overrides
+         .parse_overrides()
+         .map_err(anyhow::Error::msg)?;
++    if shared.avalai {
++        codex_utils_cli::prepend_avalai_cli_overrides(&mut cli_kv_overrides);
++    }
+     if interactive.web_search {
+         cli_kv_overrides.push((
+             "web_search".to_string(),
+@@ -2519,6 +2550,8 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
+         strict_config,
+         approval_policy,
+         web_search,
++        no_alt_screen,
++        best_profile,
+         prompt,
+         config_overrides,
+         ..
+@@ -2535,6 +2568,12 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
+     if strict_config {
+         interactive.strict_config = true;
+     }
++    if no_alt_screen {
++        interactive.no_alt_screen = true;
++    }
++    if best_profile {
++        interactive.best_profile = true;
++    }
+     if let Some(prompt) = prompt {
+         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
+         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
+@@ -2814,6 +2853,30 @@ mod tests {
+         assert_eq!(args.prompt.as_deref(), Some("re-review"));
+     }
+ 
++    #[test]
++    fn exec_resume_accepts_avalai_after_subcommand() {
++        let cli = MultitoolCli::try_parse_from([
++            "codex",
++            "exec",
++            "resume",
++            "session-123",
++            "--avalai",
++            "continue",
++        ])
++        .expect("parse should succeed");
++
++        let Some(Subcommand::Exec(exec)) = cli.subcommand else {
++            panic!("expected exec subcommand");
++        };
++        let Some(codex_exec::Command::Resume(ref args)) = exec.command else {
++            panic!("expected exec resume");
++        };
++
++        assert!(exec.avalai);
++        assert_eq!(args.session_id.as_deref(), Some("session-123"));
++        assert_eq!(args.prompt.as_deref(), Some("continue"));
++    }
++
+     #[test]
+     fn dangerous_bypass_conflicts_with_approval_policy() {
+         let err = MultitoolCli::try_parse_from([
+@@ -2987,6 +3050,98 @@ mod tests {
+         assert!(cli.subcommand.is_none());
+     }
+ 
++    #[test]
++    fn best_profile_parses_under_resume() {
++        let cli = finalize_resume_from_args(&["codex", "resume", "--best", "session-123"]);
++
++        assert!(cli.best_profile);
++        assert_eq!(cli.resume_session_id.as_deref(), Some("session-123"));
++    }
++
++    #[test]
++    fn root_best_profile_applies_to_resume() {
++        let cli = finalize_resume_from_args(&["codex", "--best", "resume", "session-123"]);
++
++        assert!(cli.best_profile);
++        assert_eq!(cli.resume_session_id.as_deref(), Some("session-123"));
++    }
++
++    #[test]
++    fn resume_best_rejects_remote_mode() {
++        let err =
++            reject_remote_mode_for_subcommand(Some("ws://localhost:9999"), None, "resume --best")
++                .expect_err("resume --best should reject remote mode");
++
++        assert!(
++            err.to_string().contains("not `codex resume --best`"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn resume_best_rejects_remote_auth_token_env() {
++        let err = reject_remote_mode_for_subcommand(None, Some("TOKEN_ENV"), "resume --best")
++            .expect_err("resume --best should reject remote auth token env");
++
++        assert!(
++            err.to_string().contains("not `codex resume --best`"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn avalai_parses_on_interactive_root() {
++        let cli = MultitoolCli::try_parse_from(["codex", "--avalai"]).expect("parse");
++
++        assert!(cli.interactive.avalai);
++        assert!(cli.subcommand.is_none());
++    }
++
++    #[test]
++    fn project_parses_on_interactive_root() {
++        let cli = MultitoolCli::try_parse_from(["codex", "--project", "agent-coordinator"])
++            .expect("parse");
++
++        assert_eq!(
++            cli.interactive.project.as_deref(),
++            Some("agent-coordinator")
++        );
++        assert!(cli.subcommand.is_none());
++    }
++
++    #[test]
++    fn project_parses_under_exec() {
++        let cli = MultitoolCli::try_parse_from([
++            "codex",
++            "exec",
++            "--project",
++            "agent-coordinator",
++            "list files",
++        ])
++        .expect("parse");
++
++        let Some(Subcommand::Exec(exec_cli)) = cli.subcommand else {
++            panic!("expected exec subcommand");
++        };
++        assert_eq!(exec_cli.project.as_deref(), Some("agent-coordinator"));
++    }
++
++    #[test]
++    fn avalai_conflicts_with_oss() {
++        let err = MultitoolCli::try_parse_from(["codex", "--avalai", "--oss"])
++            .expect_err("--avalai and --oss should conflict");
++
++        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
++    }
++
++    #[test]
++    fn avalai_conflicts_with_local_provider() {
++        let err = MultitoolCli::try_parse_from(["codex", "--avalai", "--local-provider", "ollama"])
++            .expect_err("--avalai and --local-provider should conflict");
++
++        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
++    }
++
+     #[test]
+     fn profiles_add_parses_under_codex() {
+         let cli = MultitoolCli::try_parse_from([
+@@ -3443,6 +3598,16 @@ mod tests {
+         assert_eq!(interactive.resume_session_id.as_deref(), Some("sid"));
+     }
+ 
++    #[test]
++    fn resume_merges_avalai_flag() {
++        let interactive =
++            finalize_resume_from_args(["codex", "resume", "sid", "--avalai"].as_ref());
++
++        assert!(interactive.avalai);
++        assert!(!interactive.oss);
++        assert_eq!(interactive.resume_session_id.as_deref(), Some("sid"));
++    }
++
+     #[test]
+     fn resume_merges_dangerously_bypass_flag() {
+         let interactive = finalize_resume_from_args(
+@@ -3539,6 +3704,22 @@ mod tests {
+         assert!(interactive.fork_show_all);
+     }
+ 
++    #[test]
++    fn best_profile_parses_under_fork() {
++        let cli = finalize_fork_from_args(["codex", "fork", "--best", "session-123"].as_ref());
++
++        assert!(cli.best_profile);
++        assert_eq!(cli.fork_session_id.as_deref(), Some("session-123"));
++    }
++
++    #[test]
++    fn root_best_profile_applies_to_fork() {
++        let cli = finalize_fork_from_args(["codex", "--best", "fork", "session-123"].as_ref());
++
++        assert!(cli.best_profile);
++        assert_eq!(cli.fork_session_id.as_deref(), Some("session-123"));
++    }
++
+     #[test]
+     fn app_server_analytics_default_disabled_without_flag() {
+         let app_server = app_server_from_args(["codex", "app-server"].as_ref());
+diff --git a/codex-rs/cli/src/profile_manager_cmd.rs b/codex-rs/cli/src/profile_manager_cmd.rs
+index 4d483c26..f32eee64 100644
+--- a/codex-rs/cli/src/profile_manager_cmd.rs
++++ b/codex-rs/cli/src/profile_manager_cmd.rs
+@@ -118,7 +118,7 @@ enum ProfilesCommand {
+     /// Show cached or refreshed usage limits.
+     Limits(LimitsArgs),
+ 
+-    /// Print the best currently usable profile.
++    /// Print the best currently usable existing profile.
+     Best(ProfilesFilterArgs),
+ }
+ 
+@@ -163,11 +163,11 @@ struct ProjectArgs {
+ 
+ #[derive(Debug, Args)]
+ struct RunArgs {
+-    /// Select the best usable profile from cached/refreshed limits.
++    /// Select the best usable existing profile from cached/refreshed limits.
+     #[arg(long, default_value_t = false)]
+     best: bool,
+ 
+-    /// Refresh ChatGPT usage before selecting with --best.
++    /// Refresh ChatGPT usage before selecting an existing profile with --best.
+     #[arg(long = "refresh-limits", default_value_t = false)]
+     refresh_limits: bool,
+ 
+@@ -183,7 +183,7 @@ struct RunArgs {
+     #[arg(long = "project-dir", value_name = "DIR")]
+     project_dir: Option<PathBuf>,
+ 
+-    /// Profile name. Omit with --best to auto-select.
++    /// Existing profile name. Omit with --best to auto-select.
+     name: Option<String>,
+ 
+     /// Arguments passed after `--` are forwarded to Codex.
+@@ -220,6 +220,7 @@ pub struct BestProfileLaunch {
+ pub fn prepare_best_profile_launch(
+     root_dir: Option<PathBuf>,
+     project_dir: Option<&Path>,
++    project_id: Option<&str>,
+     refresh_limits: bool,
+ ) -> anyhow::Result<BestProfileLaunch> {
+     let root = ProfilesRoot::new(resolve_root(root_dir)?);
+@@ -229,7 +230,7 @@ pub fn prepare_best_profile_launch(
+     };
+     let active_profile = active.name.clone();
+ 
+-    let (project_id, project_root) = resolve_project(project_dir, None)?;
++    let (project_id, project_root) = resolve_project(project_dir, project_id)?;
+     let codex_home = root.ensure_project_home(&project_id, &project_root, &active_profile)?;
+     let candidates = ranked
+         .into_iter()
+diff --git a/codex-rs/cli/src/profile_manager_cmd_tests.rs b/codex-rs/cli/src/profile_manager_cmd_tests.rs
+index 68338799..5b64a5eb 100644
+--- a/codex-rs/cli/src/profile_manager_cmd_tests.rs
++++ b/codex-rs/cli/src/profile_manager_cmd_tests.rs
+@@ -140,6 +140,7 @@ fn best_profile_launch_prepares_project_home_and_failover_candidates() -> anyhow
+     let launch = prepare_best_profile_launch(
+         Some(root_dir),
+         Some(project_root.as_path()),
++        /*project_id*/ None,
+         /*refresh_limits*/ false,
+     )?;
+ 
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 9733a9f6..d70235de 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -68,6 +68,40 @@ pub async fn clean_background_terminals(sess: &Arc<Session>) {
+     sess.close_unified_exec_processes().await;
+ }
+ 
++pub async fn refresh_profile_auth(sess: &Arc<Session>, sub_id: String) {
++    let refresh_message =
++        match super::managed_profiles::refresh_managed_profile_limits(/*root_dir*/ None).await {
++            Ok(reports) => super::managed_profiles::format_refresh_message(&reports),
++            Err(err) => format!("Failed to refresh managed profiles: {err:#}"),
++        };
++    let switch_message = if let Some(profile_auth_failover) =
++        sess.services.profile_auth_failover.as_ref()
++    {
++        match profile_auth_failover
++            .switch_to_next_profile(&sess.services.auth_manager)
++            .await
++        {
++            Ok(Some(profile)) => Some(format!("Switched to profile `{profile}`.")),
++            Ok(None) => Some("No remaining managed profile is available to switch to.".to_string()),
++            Err(err) => Some(format!("Failed to switch managed profile: {err:#}")),
++        }
++    } else {
++        Some(
++            "No managed profile failover is configured. Start Codex with `--best` first."
++                .to_string(),
++        )
++    };
++    let message = match switch_message {
++        Some(switch_message) => format!("{refresh_message} {switch_message}"),
++        None => refresh_message,
++    };
++    sess.send_event_raw(Event {
++        id: sub_id,
++        msg: EventMsg::Warning(WarningEvent { message }),
++    })
++    .await;
++}
++
+ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
+     sess.send_event_raw(Event {
+         id: sub_id,
+@@ -800,6 +834,10 @@ pub(super) async fn submission_loop(
+                     reload_user_config(&sess).await;
+                     false
+                 }
++                Op::RefreshProfileAuth => {
++                    refresh_profile_auth(&sess, sub.id.clone()).await;
++                    false
++                }
+                 Op::Compact => {
+                     compact(&sess, sub.id.clone()).await;
+                     false
+diff --git a/codex-rs/core/src/session/managed_profiles.rs b/codex-rs/core/src/session/managed_profiles.rs
+new file mode 100644
+index 00000000..38993467
+--- /dev/null
++++ b/codex-rs/core/src/session/managed_profiles.rs
+@@ -0,0 +1,477 @@
++use anyhow::Context;
++use codex_login::AuthDotJson;
++use codex_protocol::auth::AuthMode;
++use serde::Deserialize;
++use serde::Serialize;
++use serde_json::Value;
++use std::collections::HashSet;
++use std::env;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++const NEAR_LIMIT_PERCENT: f64 = 90.0;
++const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
++const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub(crate) enum LimitStatus {
++    Ok,
++    NearLimit,
++    Limited,
++    Unknown,
++}
++
++#[derive(Debug, Clone)]
++pub(crate) struct ManagedProfileLimitReport {
++    pub(crate) name: String,
++    status: LimitStatus,
++    five_hour_percent: Option<f64>,
++    weekly_percent: Option<f64>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct LimitCache {
++    version: u32,
++    account_id: String,
++    observed_at: u64,
++    status: LimitStatus,
++    payload: Value,
++}
++
++#[derive(Debug, Clone)]
++struct AuthSummary {
++    mode: AuthMode,
++    access_token: Option<String>,
++    account_id: Option<String>,
++    valid: bool,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct UsageWindow {
++    used_percent: f64,
++    window_minutes: Option<i64>,
++    is_secondary: bool,
++}
++
++pub(crate) async fn refresh_managed_profile_limits(
++    root_dir: Option<PathBuf>,
++) -> anyhow::Result<Vec<ManagedProfileLimitReport>> {
++    let root = resolve_root(root_dir)?;
++    let names = list_profiles(&root)?;
++    let mut reports = Vec::with_capacity(names.len());
++    let client = reqwest::Client::builder()
++        .timeout(std::time::Duration::from_secs(20))
++        .build()?;
++    for name in names {
++        reports.push(refresh_profile_limit(&client, &root, &name).await);
++    }
++    Ok(reports)
++}
++
++pub(crate) fn format_refresh_message(reports: &[ManagedProfileLimitReport]) -> String {
++    if reports.is_empty() {
++        return "No managed profiles found. Add one with `codex-profiles add NAME`.".to_string();
++    }
++
++    let usable = reports
++        .iter()
++        .filter(|report| matches!(report.status, LimitStatus::Ok | LimitStatus::NearLimit))
++        .min_by(|left, right| {
++            limit_score(left)
++                .total_cmp(&limit_score(right))
++                .then_with(|| left.name.cmp(&right.name))
++        });
++    let limited_count = reports
++        .iter()
++        .filter(|report| report.status == LimitStatus::Limited)
++        .count();
++    let unknown_count = reports
++        .iter()
++        .filter(|report| report.status == LimitStatus::Unknown)
++        .count();
++
++    let availability = usable.map_or_else(
++        || "No usable managed profile is currently available.".to_string(),
++        |report| {
++            format!(
++                "Best available: `{}` (5h {}, weekly {}).",
++                report.name,
++                percent_text(report.five_hour_percent),
++                percent_text(report.weekly_percent)
++            )
++        },
++    );
++    let mut suffixes = Vec::new();
++    if limited_count > 0 {
++        suffixes.push(format!("{limited_count} limited"));
++    }
++    if unknown_count > 0 {
++        suffixes.push(format!("{unknown_count} unknown"));
++    }
++    if suffixes.is_empty() {
++        format!(
++            "Refreshed {} managed profile{}. {availability}",
++            reports.len(),
++            plural_suffix(reports.len())
++        )
++    } else {
++        format!(
++            "Refreshed {} managed profile{}. {availability} ({})",
++            reports.len(),
++            plural_suffix(reports.len()),
++            suffixes.join(", ")
++        )
++    }
++}
++
++async fn refresh_profile_limit(
++    client: &reqwest::Client,
++    root: &Path,
++    name: &str,
++) -> ManagedProfileLimitReport {
++    let home = profile_home(root, name);
++    let Ok(auth) = read_auth_summary(&home) else {
++        return ManagedProfileLimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++        };
++    };
++
++    if !auth.valid {
++        return ManagedProfileLimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++        };
++    }
++
++    if !matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
++        return ManagedProfileLimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Ok,
++            five_hour_percent: Some(0.0),
++            weekly_percent: Some(0.0),
++        };
++    }
++
++    match fetch_limits(client, &auth).await {
++        Ok(cache) => {
++            let _ = write_limit_cache(root, name, &cache);
++            report_from_cache(name, cache)
++        }
++        Err(_) => ManagedProfileLimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++        },
++    }
++}
++
++fn resolve_root(root_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
++    if let Some(root) = root_dir {
++        return Ok(root);
++    }
++    if let Some(root) = env::var_os("CODEX_PROFILES_DIR") {
++        return Ok(PathBuf::from(root));
++    }
++    let home = dirs::home_dir().context("could not resolve home directory")?;
++    Ok(home.join(".config").join("codex-switch"))
++}
++
++fn list_profiles(root: &Path) -> anyhow::Result<Vec<String>> {
++    let homes = homes_dir(root);
++    if !homes.is_dir() {
++        return Ok(Vec::new());
++    }
++
++    let mut names = HashSet::new();
++    for entry in fs::read_dir(homes)? {
++        let entry = entry?;
++        if entry.file_type()?.is_dir() {
++            let name = entry.file_name().to_string_lossy().to_string();
++            if is_valid_name(&name) {
++                names.insert(name);
++            }
++        }
++    }
++
++    let mut names = names.into_iter().collect::<Vec<_>>();
++    names.sort();
++    Ok(names)
++}
++
++fn read_auth_summary(codex_home: &Path) -> anyhow::Result<AuthSummary> {
++    let path = codex_home.join("auth.json");
++    let contents =
++        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
++    let auth: AuthDotJson = serde_json::from_str(&contents)
++        .with_context(|| format!("failed to parse {}", path.display()))?;
++    Ok(auth_summary(&auth))
++}
++
++fn auth_summary(auth: &AuthDotJson) -> AuthSummary {
++    let mode = resolved_auth_mode(auth);
++    let valid = match mode {
++        AuthMode::ApiKey => match auth.openai_api_key.as_deref() {
++            Some(key) if !key.trim().is_empty() => true,
++            Some(_) | None => false,
++        },
++        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
++            match auth
++                .tokens
++                .as_ref()
++                .map(|tokens| tokens.access_token.trim())
++            {
++                Some(access_token) if !access_token.is_empty() => true,
++                Some(_) | None => false,
++            }
++        }
++        AuthMode::AgentIdentity => auth
++            .agent_identity
++            .as_ref()
++            .is_some_and(codex_login::auth::AgentIdentityStorage::has_auth_material),
++        AuthMode::PersonalAccessToken => auth
++            .personal_access_token
++            .as_deref()
++            .is_some_and(|token| !token.trim().is_empty()),
++        AuthMode::BedrockApiKey => auth.bedrock_api_key.is_some(),
++    };
++
++    AuthSummary {
++        mode,
++        access_token: auth
++            .tokens
++            .as_ref()
++            .map(|tokens| tokens.access_token.clone()),
++        account_id: auth.tokens.as_ref().and_then(|tokens| {
++            tokens
++                .account_id
++                .clone()
++                .or_else(|| tokens.id_token.chatgpt_account_id.clone())
++        }),
++        valid,
++    }
++}
++
++fn resolved_auth_mode(auth: &AuthDotJson) -> AuthMode {
++    if let Some(mode) = auth.auth_mode {
++        return mode;
++    }
++    if auth.personal_access_token.is_some() {
++        return AuthMode::PersonalAccessToken;
++    }
++    if auth.bedrock_api_key.is_some() {
++        return AuthMode::BedrockApiKey;
++    }
++    if auth.openai_api_key.is_some() {
++        return AuthMode::ApiKey;
++    }
++    AuthMode::Chatgpt
++}
++
++async fn fetch_limits(client: &reqwest::Client, auth: &AuthSummary) -> anyhow::Result<LimitCache> {
++    let access_token = auth
++        .access_token
++        .as_deref()
++        .context("missing ChatGPT access token")?;
++    let account_id = auth
++        .account_id
++        .as_deref()
++        .context("missing ChatGPT account id")?;
++    let url = env::var("CODEX_PROFILES_LIMITS_URL")
++        .unwrap_or_else(|_| "https://chatgpt.com/backend-api/wham/usage".to_string());
++    let payload: Value = client
++        .get(url)
++        .bearer_auth(access_token)
++        .header("ChatGPT-Account-ID", account_id)
++        .header("User-Agent", "codex-profiles")
++        .send()
++        .await?
++        .error_for_status()?
++        .json()
++        .await?;
++    let status = classify_limit_status(&payload);
++    Ok(LimitCache {
++        version: 1,
++        account_id: account_id.to_string(),
++        observed_at: unix_now(),
++        status,
++        payload,
++    })
++}
++
++fn write_limit_cache(root: &Path, name: &str, cache: &LimitCache) -> anyhow::Result<()> {
++    let limits = limits_dir(root);
++    fs::create_dir_all(&limits)?;
++    let path = limits.join(format!("{name}.json"));
++    fs::write(&path, serde_json::to_vec_pretty(cache)?)?;
++    restrict_file(&path)
++}
++
++#[cfg(unix)]
++fn restrict_file(path: &Path) -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn restrict_file(_path: &Path) -> anyhow::Result<()> {
++    Ok(())
++}
++
++fn report_from_cache(name: &str, cache: LimitCache) -> ManagedProfileLimitReport {
++    ManagedProfileLimitReport {
++        name: name.to_string(),
++        status: cache.status,
++        five_hour_percent: labeled_window_percent(&cache.payload, WindowLabel::FiveHour),
++        weekly_percent: labeled_window_percent(&cache.payload, WindowLabel::Weekly),
++    }
++}
++
++fn classify_limit_status(payload: &Value) -> LimitStatus {
++    if payload
++        .pointer("/rate_limit_reached_type/type")
++        .and_then(Value::as_str)
++        .is_some_and(|value| !value.is_empty())
++    {
++        return LimitStatus::Limited;
++    }
++    let max_percent = usage_windows(payload)
++        .into_iter()
++        .map(|window| window.used_percent)
++        .fold(0.0, f64::max);
++    if max_percent >= 100.0 {
++        LimitStatus::Limited
++    } else if max_percent >= NEAR_LIMIT_PERCENT {
++        LimitStatus::NearLimit
++    } else {
++        LimitStatus::Ok
++    }
++}
++
++#[derive(Clone, Copy)]
++enum WindowLabel {
++    FiveHour,
++    Weekly,
++}
++
++fn labeled_window_percent(payload: &Value, label: WindowLabel) -> Option<f64> {
++    let windows = usage_windows(payload);
++    windows
++        .iter()
++        .find(|window| matches_window_label(window.window_minutes, label))
++        .or_else(|| fallback_window(&windows, label))
++        .map(|window| window.used_percent)
++}
++
++fn usage_windows(payload: &Value) -> Vec<UsageWindow> {
++    let mut windows = Vec::new();
++    if let Some(window) = usage_window(payload, "primary_window", /*is_secondary*/ false) {
++        windows.push(window);
++    }
++    if let Some(window) = usage_window(payload, "secondary_window", /*is_secondary*/ true) {
++        windows.push(window);
++    }
++    windows
++}
++
++fn usage_window(payload: &Value, name: &str, is_secondary: bool) -> Option<UsageWindow> {
++    let used_percent = payload
++        .pointer(&format!("/rate_limit/{name}/used_percent"))
++        .and_then(Value::as_f64)?;
++    let window_minutes = payload
++        .pointer(&format!("/rate_limit/{name}/window_minutes"))
++        .and_then(Value::as_i64)
++        .or_else(|| {
++            payload
++                .pointer(&format!("/rate_limit/{name}/limit_window_seconds"))
++                .and_then(Value::as_i64)
++                .map(|seconds| seconds / 60)
++        });
++    Some(UsageWindow {
++        used_percent,
++        window_minutes,
++        is_secondary,
++    })
++}
++
++fn matches_window_label(window_minutes: Option<i64>, label: WindowLabel) -> bool {
++    let Some(window_minutes) = window_minutes else {
++        return false;
++    };
++    match label {
++        WindowLabel::FiveHour => is_approximate_window(window_minutes, FIVE_HOUR_WINDOW_MINUTES),
++        WindowLabel::Weekly => is_approximate_window(window_minutes, WEEKLY_WINDOW_MINUTES),
++    }
++}
++
++fn fallback_window(windows: &[UsageWindow], label: WindowLabel) -> Option<&UsageWindow> {
++    windows.iter().find(|window| match label {
++        WindowLabel::FiveHour => !window.is_secondary,
++        WindowLabel::Weekly => window.is_secondary,
++    })
++}
++
++fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
++    let minutes = minutes.max(0) as f64;
++    let expected_minutes = expected_minutes as f64;
++    minutes >= expected_minutes * 0.95 && minutes <= expected_minutes * 1.05
++}
++
++fn limit_score(report: &ManagedProfileLimitReport) -> f64 {
++    report
++        .five_hour_percent
++        .unwrap_or(100.0)
++        .max(report.weekly_percent.unwrap_or(100.0))
++}
++
++fn percent_text(value: Option<f64>) -> String {
++    value.map_or_else(|| "-".to_string(), |value| format!("{value:.0}%"))
++}
++
++fn plural_suffix(count: usize) -> &'static str {
++    if count == 1 { "" } else { "s" }
++}
++
++fn homes_dir(root: &Path) -> PathBuf {
++    root.join("homes")
++}
++
++fn profile_home(root: &Path, name: &str) -> PathBuf {
++    homes_dir(root).join(name)
++}
++
++fn limits_dir(root: &Path) -> PathBuf {
++    root.join("limits")
++}
++
++fn is_valid_name(name: &str) -> bool {
++    let mut chars = name.chars();
++    let Some(first) = chars.next() else {
++        return false;
++    };
++    if !first.is_ascii_alphanumeric() {
++        return false;
++    }
++    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')) && name.len() <= 64
++}
++
++fn unix_now() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs()
++}
++
++#[cfg(test)]
++#[path = "managed_profiles_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/session/managed_profiles_tests.rs b/codex-rs/core/src/session/managed_profiles_tests.rs
+new file mode 100644
+index 00000000..db6d34d4
+--- /dev/null
++++ b/codex-rs/core/src/session/managed_profiles_tests.rs
+@@ -0,0 +1,49 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++fn write_api_auth(path: &Path, key: &str) -> anyhow::Result<()> {
++    fs::write(
++        path,
++        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{key}"}}"#),
++    )?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn refresh_managed_profile_limits_returns_empty_when_no_profiles_exist() -> anyhow::Result<()>
++{
++    let temp = TempDir::new()?;
++
++    let reports = refresh_managed_profile_limits(Some(temp.path().join("codex-switch"))).await?;
++
++    assert_eq!(reports.len(), 0);
++    assert_eq!(
++        format_refresh_message(&reports),
++        "No managed profiles found. Add one with `codex-profiles add NAME`."
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn refresh_managed_profile_limits_reports_api_key_profiles_without_remote_fetch()
++-> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let root = temp.path().join("codex-switch");
++    let home = root.join("homes").join("main");
++    fs::create_dir_all(&home)?;
++    write_api_auth(&home.join("auth.json"), "sk-test")?;
++
++    let reports = refresh_managed_profile_limits(Some(root)).await?;
++
++    assert_eq!(reports.len(), 1);
++    assert_eq!(reports[0].name, "main");
++    assert_eq!(reports[0].status, LimitStatus::Ok);
++    assert_eq!(reports[0].five_hour_percent, Some(0.0));
++    assert_eq!(reports[0].weekly_percent, Some(0.0));
++    assert_eq!(
++        format_refresh_message(&reports),
++        "Refreshed 1 managed profile. Best available: `main` (5h 0%, weekly 0%)."
++    );
++    Ok(())
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 13b6de7b..7bfb25f8 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -207,6 +207,7 @@ pub(crate) mod context_window;
+ mod handlers;
+ mod inject;
+ mod input_queue;
++pub(crate) mod managed_profiles;
+ mod mcp;
+ mod mcp_runtime;
+ pub(crate) mod multi_agents;
+diff --git a/codex-rs/core/src/session/profile_auth_failover.rs b/codex-rs/core/src/session/profile_auth_failover.rs
+index 7db5ea11..e01f7174 100644
+--- a/codex-rs/core/src/session/profile_auth_failover.rs
++++ b/codex-rs/core/src/session/profile_auth_failover.rs
+@@ -34,7 +34,7 @@ pub(crate) struct ProfileAuthFailover {
+ 
+ impl ProfileAuthFailover {
+     pub(crate) fn new(codex_home: PathBuf, config: ProfileAuthFailoverConfig) -> Option<Self> {
+-        if config.candidates.len() < 2 {
++        if config.candidates.is_empty() {
+             return None;
+         }
+         let candidates = config
+@@ -76,6 +76,24 @@ impl ProfileAuthFailover {
+         let Some(next) = next else {
+             return Ok(None);
+         };
++        self.switch_to_candidate(auth_manager, next).await
++    }
++
++    pub(crate) async fn switch_to_next_profile(
++        &self,
++        auth_manager: &AuthManager,
++    ) -> anyhow::Result<Option<String>> {
++        let Some(next) = self.next_candidate_after_marking_active_limited()? else {
++            return Ok(None);
++        };
++        self.switch_to_candidate(auth_manager, next).await
++    }
++
++    async fn switch_to_candidate(
++        &self,
++        auth_manager: &AuthManager,
++        next: ProfileAuthCandidate,
++    ) -> anyhow::Result<Option<String>> {
+         copy_auth_file(&next.auth_file, &self.codex_home.join("auth.json"))?;
+         auth_manager.reload().await;
+ 
+diff --git a/codex-rs/core/src/session/profile_auth_failover_tests.rs b/codex-rs/core/src/session/profile_auth_failover_tests.rs
+index 7c026f4f..977d263b 100644
+--- a/codex-rs/core/src/session/profile_auth_failover_tests.rs
++++ b/codex-rs/core/src/session/profile_auth_failover_tests.rs
+@@ -157,3 +157,98 @@ async fn switch_after_usage_limit_copies_next_auth_and_reloads_manager() -> anyh
+     );
+     Ok(())
+ }
++
++#[tokio::test]
++async fn switch_to_next_profile_copies_next_auth_and_reloads_manager() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let codex_home = temp.path().join("project-home");
++    let profiles = temp.path().join("profiles");
++    let main = profiles.join("main");
++    let backup = profiles.join("backup");
++    fs::create_dir_all(&codex_home)?;
++    fs::create_dir_all(&main)?;
++    fs::create_dir_all(&backup)?;
++    write_api_auth(&codex_home.join("auth.json"), "sk-main")?;
++    write_api_auth(&main.join("auth.json"), "sk-main")?;
++    write_api_auth(&backup.join("auth.json"), "sk-backup")?;
++    let auth_manager = AuthManager::shared(
++        codex_home.clone(),
++        /*enable_codex_api_key_env*/ false,
++        AuthCredentialsStoreMode::File,
++        /*forced_chatgpt_workspace_id*/ None,
++        /*chatgpt_base_url*/ None,
++        AuthKeyringBackendKind::default(),
++        /*auth_route_config*/ None,
++    )
++    .await;
++    let failover = ProfileAuthFailover::new(
++        codex_home.clone(),
++        ProfileAuthFailoverConfig {
++            active_profile: "main".to_string(),
++            candidates: vec![
++                ProfileAuthCandidateConfig {
++                    name: "main".to_string(),
++                    auth_file: main.join("auth.json"),
++                    limit_file: None,
++                },
++                ProfileAuthCandidateConfig {
++                    name: "backup".to_string(),
++                    auth_file: backup.join("auth.json"),
++                    limit_file: None,
++                },
++            ],
++        },
++    )
++    .expect("two candidates should enable failover");
++
++    assert_eq!(
++        failover.switch_to_next_profile(&auth_manager).await?,
++        Some("backup".to_string())
++    );
++    assert_eq!(
++        auth_manager
++            .auth()
++            .await
++            .and_then(|auth| auth.api_key().map(str::to_string)),
++        Some("sk-backup".to_string())
++    );
++    assert_eq!(failover.switch_to_next_profile(&auth_manager).await?, None);
++    Ok(())
++}
++
++#[tokio::test]
++async fn single_candidate_is_configured_but_has_no_next_profile() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let codex_home = temp.path().join("project-home");
++    let profiles = temp.path().join("profiles");
++    let main = profiles.join("main");
++    fs::create_dir_all(&codex_home)?;
++    fs::create_dir_all(&main)?;
++    write_api_auth(&codex_home.join("auth.json"), "sk-main")?;
++    write_api_auth(&main.join("auth.json"), "sk-main")?;
++    let auth_manager = AuthManager::shared(
++        codex_home.clone(),
++        /*enable_codex_api_key_env*/ false,
++        AuthCredentialsStoreMode::File,
++        /*forced_chatgpt_workspace_id*/ None,
++        /*chatgpt_base_url*/ None,
++        AuthKeyringBackendKind::default(),
++        /*auth_route_config*/ None,
++    )
++    .await;
++    let failover = ProfileAuthFailover::new(
++        codex_home,
++        ProfileAuthFailoverConfig {
++            active_profile: "main".to_string(),
++            candidates: vec![ProfileAuthCandidateConfig {
++                name: "main".to_string(),
++                auth_file: main.join("auth.json"),
++                limit_file: None,
++            }],
++        },
++    )
++    .expect("one candidate should keep managed profile mode configured");
++
++    assert_eq!(failover.switch_to_next_profile(&auth_manager).await?, None);
++    Ok(())
++}
+diff --git a/codex-rs/core/tests/common/test_codex.rs b/codex-rs/core/tests/common/test_codex.rs
+index e0e82c37..f200688c 100644
+--- a/codex-rs/core/tests/common/test_codex.rs
++++ b/codex-rs/core/tests/common/test_codex.rs
+@@ -599,9 +599,13 @@ impl TestCodexBuilder {
+                     config.codex_home.clone(),
+                 ))
+             });
++        let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
++            auth.clone(),
++            config.codex_home.to_path_buf(),
++        );
+         let thread_manager = ThreadManager::new(
+             &config,
+-            codex_core::test_support::auth_manager_from_auth(auth.clone()),
++            Arc::clone(&auth_manager),
+             SessionSource::Exec,
+             Arc::clone(&environment_manager),
+             Arc::clone(&self.extensions),
+@@ -616,64 +620,61 @@ impl TestCodexBuilder {
+         let thread_manager = Arc::new(thread_manager);
+         let user_shell_override = self.user_shell_override.clone();
+ 
+-        let new_conversation = match (resume_from, user_shell_override) {
+-            (Some(path), Some(user_shell_override)) => {
+-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+-                Box::pin(
++        let new_conversation =
++            match (resume_from, user_shell_override) {
++                (Some(path), Some(user_shell_override)) => Box::pin(
+                     codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
+                         thread_manager.as_ref(),
+                         config.clone(),
+                         path,
+-                        auth_manager,
++                        Arc::clone(&auth_manager),
+                         user_shell_override,
+                         self.supports_openai_form_elicitation,
+                     ),
+                 )
+-                .await?
+-            }
+-            (Some(path), None) => {
+-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+-                Box::pin(thread_manager.resume_thread_from_rollout(
+-                    config.clone(),
+-                    path,
+-                    auth_manager,
+-                    /*parent_trace*/ None,
+-                    self.supports_openai_form_elicitation,
+-                ))
+-                .await?
+-            }
+-            (None, Some(user_shell_override)) => {
+-                Box::pin(
+-                    codex_core::test_support::start_thread_with_user_shell_override(
+-                        thread_manager.as_ref(),
++                .await?,
++                (Some(path), None) => {
++                    Box::pin(thread_manager.resume_thread_from_rollout(
+                         config.clone(),
+-                        user_shell_override,
++                        path,
++                        Arc::clone(&auth_manager),
++                        /*parent_trace*/ None,
+                         self.supports_openai_form_elicitation,
+-                    ),
+-                )
+-                .await?
+-            }
+-            (None, None) => {
+-                let environments = thread_manager.default_environment_selections(&config.cwd);
+-                Box::pin(
+-                    thread_manager.start_thread_with_options(StartThreadOptions {
+-                        config: config.clone(),
+-                        allow_provider_model_fallback: false,
+-                        initial_history: InitialHistory::New,
+-                        history_mode: None,
+-                        session_source: None,
+-                        thread_source: None,
+-                        dynamic_tools: Vec::new(),
+-                        metrics_service_name: None,
+-                        parent_trace: None,
+-                        environments,
+-                        thread_extension_init: Default::default(),
+-                        supports_openai_form_elicitation: self.supports_openai_form_elicitation,
+-                    }),
+-                )
+-                .await?
+-            }
+-        };
++                    ))
++                    .await?
++                }
++                (None, Some(user_shell_override)) => {
++                    Box::pin(
++                        codex_core::test_support::start_thread_with_user_shell_override(
++                            thread_manager.as_ref(),
++                            config.clone(),
++                            user_shell_override,
++                            self.supports_openai_form_elicitation,
++                        ),
++                    )
++                    .await?
++                }
++                (None, None) => {
++                    let environments = thread_manager.default_environment_selections(&config.cwd);
++                    Box::pin(
++                        thread_manager.start_thread_with_options(StartThreadOptions {
++                            config: config.clone(),
++                            allow_provider_model_fallback: false,
++                            initial_history: InitialHistory::New,
++                            history_mode: None,
++                            session_source: None,
++                            thread_source: None,
++                            dynamic_tools: Vec::new(),
++                            metrics_service_name: None,
++                            parent_trace: None,
++                            environments,
++                            thread_extension_init: Default::default(),
++                            supports_openai_form_elicitation: self.supports_openai_form_elicitation,
++                        }),
++                    )
++                    .await?
++                }
++            };
+ 
+         Ok(TestCodex {
+             home,
+diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
+index 3e274633..70ed24c3 100644
+--- a/codex-rs/core/tests/suite/mod.rs
++++ b/codex-rs/core/tests/suite/mod.rs
+@@ -85,6 +85,7 @@ mod permissions_messages;
+ mod personality;
+ mod personality_migration;
+ mod plugins;
++mod profile_auth_failover;
+ mod prompt_caching;
+ mod prompt_debug_tests;
+ mod quota_exceeded;
+diff --git a/codex-rs/core/tests/suite/profile_auth_failover.rs b/codex-rs/core/tests/suite/profile_auth_failover.rs
+new file mode 100644
+index 00000000..b0334403
+--- /dev/null
++++ b/codex-rs/core/tests/suite/profile_auth_failover.rs
+@@ -0,0 +1,120 @@
++use std::fs;
++use std::sync::Arc;
++
++use anyhow::Result;
++use codex_core::config::ProfileAuthCandidateConfig;
++use codex_core::config::ProfileAuthFailoverConfig;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_response_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::sse_response;
++use core_test_support::responses::start_mock_server;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use tempfile::TempDir;
++use wiremock::ResponseTemplate;
++
++fn write_api_auth(path: &std::path::Path, key: &str) -> Result<()> {
++    fs::write(
++        path,
++        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{key}"}}"#),
++    )?;
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn usage_limit_switches_profile_and_retries_turn() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let home = Arc::new(TempDir::new()?);
++    let codex_home = home.path().to_path_buf();
++    let profiles = home.path().join("profiles");
++    let main = profiles.join("main");
++    let backup = profiles.join("backup");
++    fs::create_dir_all(&main)?;
++    fs::create_dir_all(&backup)?;
++    write_api_auth(&codex_home.join("auth.json"), "sk-main")?;
++    write_api_auth(&main.join("auth.json"), "sk-main")?;
++    write_api_auth(&backup.join("auth.json"), "sk-backup")?;
++    let main_auth_file = main.join("auth.json");
++    let backup_auth_file = backup.join("auth.json");
++    let expected_auth_file = backup_auth_file.clone();
++
++    let usage_limit_response = ResponseTemplate::new(429).set_body_json(json!({
++        "error": {
++            "type": "usage_limit_reached",
++            "message": "limit reached"
++        }
++    }));
++    let retry_response = sse_response(sse(vec![
++        ev_response_created("resp-2"),
++        ev_assistant_message("msg-1", "retried"),
++        ev_completed("resp-2"),
++    ]));
++    let responses_mock =
++        mount_response_sequence(&server, vec![usage_limit_response, retry_response]).await;
++
++    let mut builder = test_codex()
++        .with_home(Arc::clone(&home))
++        .with_config(move |config| {
++            config.profile_auth_failover = Some(ProfileAuthFailoverConfig {
++                active_profile: "main".to_string(),
++                candidates: vec![
++                    ProfileAuthCandidateConfig {
++                        name: "main".to_string(),
++                        auth_file: main_auth_file,
++                        limit_file: None,
++                    },
++                    ProfileAuthCandidateConfig {
++                        name: "backup".to_string(),
++                        auth_file: backup_auth_file,
++                        limit_file: None,
++                    },
++                ],
++            });
++        });
++    let test = builder.build(&server).await?;
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "retry after usage limit".into(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let warning = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Warning(_))).await;
++    let EventMsg::Warning(warning) = warning else {
++        unreachable!();
++    };
++    assert_eq!(
++        warning.message,
++        "Usage limit reached; switched to profile `backup` and retrying."
++    );
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++
++    assert_eq!(responses_mock.requests().len(), 2);
++    assert_eq!(
++        fs::read_to_string(codex_home.join("auth.json"))?,
++        fs::read_to_string(expected_auth_file)?
++    );
++
++    Ok(())
++}
+diff --git a/codex-rs/exec/src/cli.rs b/codex-rs/exec/src/cli.rs
+index 53124c11..b3398e79 100644
+--- a/codex-rs/exec/src/cli.rs
++++ b/codex-rs/exec/src/cli.rs
+@@ -156,6 +156,11 @@ impl FromArgMatches for ExecSharedCliOptions {
+ 
+ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
+     cmd.mut_arg("model", |arg| arg.global(true))
++        .mut_arg("oss", |arg| arg.global(true))
++        .mut_arg("avalai", |arg| arg.global(true))
++        .mut_arg("oss_provider", |arg| arg.global(true))
++        .mut_arg("project", |arg| arg.global(true))
++        .mut_arg("project_dir", |arg| arg.global(true))
+         .mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {
+             arg.global(true)
+         })
+diff --git a/codex-rs/exec/src/cli_tests.rs b/codex-rs/exec/src/cli_tests.rs
+index 524067dd..b762de75 100644
+--- a/codex-rs/exec/src/cli_tests.rs
++++ b/codex-rs/exec/src/cli_tests.rs
+@@ -61,6 +61,39 @@ fn resume_accepts_output_flags_after_subcommand() {
+     assert_eq!(args.prompt.as_deref(), Some(PROMPT));
+ }
+ 
++#[test]
++fn resume_accepts_avalai_after_subcommand() {
++    const PROMPT: &str = "echo resume-with-avalai";
++    let cli = Cli::parse_from(["codex-exec", "resume", "session-123", "--avalai", PROMPT]);
++
++    assert!(cli.avalai);
++    let Some(Command::Resume(args)) = cli.command else {
++        panic!("expected resume command");
++    };
++    assert_eq!(args.session_id.as_deref(), Some("session-123"));
++    assert_eq!(args.prompt.as_deref(), Some(PROMPT));
++}
++
++#[test]
++fn resume_accepts_project_after_subcommand() {
++    const PROMPT: &str = "echo resume-with-project";
++    let cli = Cli::parse_from([
++        "codex-exec",
++        "resume",
++        "session-123",
++        "--project",
++        "agent-coordinator",
++        PROMPT,
++    ]);
++
++    assert_eq!(cli.project.as_deref(), Some("agent-coordinator"));
++    let Some(Command::Resume(args)) = cli.command else {
++        panic!("expected resume command");
++    };
++    assert_eq!(args.session_id.as_deref(), Some("session-123"));
++    assert_eq!(args.prompt.as_deref(), Some(PROMPT));
++}
++
+ #[test]
+ fn parses_config_isolation_flags() {
+     let cli = Cli::parse_from([
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index ee39420c..76345367 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -99,6 +99,8 @@ use codex_protocol::user_input::UserInput;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+ use codex_utils_cli::SharedCliOptions;
++use codex_utils_cli::prepare_project_home;
++use codex_utils_cli::prepend_avalai_cli_overrides;
+ use codex_utils_oss::ensure_oss_provider_ready;
+ use codex_utils_oss::get_default_model_for_oss_provider;
+ use event_processor_with_human_output::EventProcessorWithHumanOutput;
+@@ -267,8 +269,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+         images,
+         model: model_cli_arg,
+         oss,
++        avalai,
+         oss_provider,
+         config_profile_v2,
++        project,
++        project_dir,
+         sandbox_mode: sandbox_mode_cli_arg,
+         dangerously_bypass_approvals_and_sandbox,
+         bypass_hook_trust,
+@@ -298,7 +303,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+     };
+ 
+     // Parse `-c` overrides from the CLI.
+-    let cli_kv_overrides = match config_overrides.parse_overrides() {
++    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
+         Ok(v) => v,
+         #[allow(clippy::print_stderr)]
+         Err(e) => {
+@@ -306,6 +311,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+             std::process::exit(1);
+         }
+     };
++    if avalai {
++        prepend_avalai_cli_overrides(&mut cli_kv_overrides);
++    }
+ 
+     let resolved_cwd = cwd.clone();
+     let config_cwd = match resolved_cwd.as_deref() {
+@@ -317,16 +325,38 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+ 
+     // we load config.toml here to determine project state.
+     #[allow(clippy::print_stderr)]
+-    let codex_home = match find_codex_home() {
++    let base_codex_home = match find_codex_home() {
+         Ok(codex_home) => codex_home,
+         Err(err) => {
+             eprintln!("Error finding codex home: {err}");
+             std::process::exit(1);
+         }
+     };
+-    let user_config_path = config_profile_v2
++    let project_dir = project_dir.as_deref().or(cwd.as_deref());
++    let project_launch = project
++        .as_deref()
++        .map(|project_id| prepare_project_home(base_codex_home.as_path(), project_id, project_dir))
++        .transpose()?;
++    let codex_home = project_launch
++        .as_ref()
++        .map(|launch| launch.codex_home.clone())
++        .unwrap_or_else(|| base_codex_home.to_path_buf());
++    let config_source_home = project_launch
+         .as_ref()
+-        .map(|profile_v2| resolve_profile_v2_config_path(&codex_home, profile_v2));
++        .map(|launch| launch.base_codex_home.as_path())
++        .unwrap_or(codex_home.as_path());
++    let user_config_path = if let Some(profile_v2) = config_profile_v2.as_ref() {
++        Some(resolve_profile_v2_config_path(
++            config_source_home,
++            profile_v2,
++        ))
++    } else if project_launch.is_some() {
++        Some(AbsolutePathBuf::from_absolute_path(
++            config_source_home.join("config.toml"),
++        )?)
++    } else {
++        None
++    };
+     let loader_overrides = LoaderOverrides {
+         user_config_path,
+         user_config_profile: config_profile_v2,
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 96a793bc..8f582801 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -634,6 +634,12 @@ pub enum Op {
+     /// enable/disable state) without restarting the thread.
+     ReloadUserConfig,
+ 
++    /// Switch to the next managed auth profile configured by `codex --best`.
++    ///
++    /// This only swaps session auth and does not start a turn or mutate
++    /// conversation context.
++    RefreshProfileAuth,
++
+     /// Request the agent to summarize the current conversation context.
+     /// The agent will use its existing context (either conversation history or previous response id)
+     /// to generate a summary which will be returned as an AgentMessage event.
+@@ -869,6 +875,7 @@ impl Op {
+             Self::DynamicToolResponse { .. } => "dynamic_tool_response",
+             Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
+             Self::ReloadUserConfig => "reload_user_config",
++            Self::RefreshProfileAuth => "refresh_profile_auth",
+             Self::Compact => "compact",
+             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
+             Self::ThreadRollback { .. } => "thread_rollback",
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index b149fd53..df3df07d 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -735,6 +735,10 @@ impl App {
+                 app_server.reload_user_config().await?;
+                 Ok(true)
+             }
++            AppCommand::RefreshProfileAuth => {
++                app_server.thread_profile_refresh(thread_id).await?;
++                Ok(true)
++            }
+             AppCommand::OverrideTurnContext { .. } => {
+                 self.sync_override_turn_context_settings(app_server, thread_id, op)
+                     .await;
+diff --git a/codex-rs/tui/src/app_command.rs b/codex-rs/tui/src/app_command.rs
+index 17587231..0402bcb0 100644
+--- a/codex-rs/tui/src/app_command.rs
++++ b/codex-rs/tui/src/app_command.rs
+@@ -84,6 +84,7 @@ pub(crate) enum AppCommand {
+         response: RequestPermissionsResponse,
+     },
+     ReloadUserConfig,
++    RefreshProfileAuth,
+     ListSkills {
+         cwds: Vec<PathBuf>,
+         force_reload: bool,
+@@ -239,6 +240,10 @@ impl AppCommand {
+         Self::ReloadUserConfig
+     }
+ 
++    pub(crate) fn refresh_profile_auth() -> Self {
++        Self::RefreshProfileAuth
++    }
++
+     pub(crate) fn list_skills(cwds: Vec<PathBuf>, force_reload: bool) -> Self {
+         Self::ListSkills { cwds, force_reload }
+     }
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index aeca1709..ecba7ed7 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -81,6 +81,8 @@ use codex_app_server_protocol::ThreadMemoryModeSetResponse;
+ use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+ use codex_app_server_protocol::ThreadMetadataUpdateParams;
+ use codex_app_server_protocol::ThreadMetadataUpdateResponse;
++use codex_app_server_protocol::ThreadProfileRefreshParams;
++use codex_app_server_protocol::ThreadProfileRefreshResponse;
+ use codex_app_server_protocol::ThreadReadParams;
+ use codex_app_server_protocol::ThreadReadResponse;
+ use codex_app_server_protocol::ThreadResumeParams;
+@@ -1076,6 +1078,21 @@ impl AppServerSession {
+         Ok(())
+     }
+ 
++    pub(crate) async fn thread_profile_refresh(&mut self, thread_id: ThreadId) -> Result<()> {
++        let request_id = self.next_request_id();
++        let _: ThreadProfileRefreshResponse = self
++            .client
++            .request_typed(ClientRequest::ThreadProfileRefresh {
++                request_id,
++                params: ThreadProfileRefreshParams {
++                    thread_id: thread_id.to_string(),
++                },
++            })
++            .await
++            .wrap_err("thread/profile/refresh failed in TUI")?;
++        Ok(())
++    }
++
+     pub(crate) async fn thread_rollback(
+         &mut self,
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/bottom_pane/slash_commands.rs b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+index 6ca1ba93..925e8d39 100644
+--- a/codex-rs/tui/src/bottom_pane/slash_commands.rs
++++ b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+@@ -309,6 +309,7 @@ mod tests {
+                 SlashCommand::Mention,
+                 SlashCommand::Status,
+                 SlashCommand::Usage,
++                SlashCommand::RefreshProfile,
+             ]
+         );
+     }
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index df9c65f8..1d914aeb 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -448,6 +448,9 @@ impl ChatWidget {
+                     self.open_usage_menu();
+                 }
+             }
++            SlashCommand::RefreshProfile => {
++                self.submit_op(AppCommand::refresh_profile_auth());
++            }
+             SlashCommand::Ide => {
+                 self.handle_ide_command();
+             }
+@@ -1043,6 +1046,7 @@ impl ChatWidget {
+             SlashCommand::Ide
+             | SlashCommand::Status
+             | SlashCommand::Usage
++            | SlashCommand::RefreshProfile
+             | SlashCommand::DebugConfig
+             | SlashCommand::Ps
+             | SlashCommand::Stop
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+index d8b3f8a0..3679d8de 100644
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -35,6 +35,18 @@ fn fast_tier_command() -> ServiceTierCommand {
+     }
+ }
+ 
++#[tokio::test]
++async fn refresh_profile_command_submits_profile_auth_refresh() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.dispatch_command(SlashCommand::RefreshProfile);
++
++    match op_rx.try_recv() {
++        Ok(Op::RefreshProfileAuth) => {}
++        other => panic!("expected RefreshProfileAuth op, got {other:?}"),
++    }
++}
++
+ fn complete_turn_with_message(chat: &mut ChatWidget, turn_id: &str, message: Option<&str>) {
+     if let Some(message) = message {
+         complete_assistant_message(
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 41cdb624..12c7477f 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -60,6 +60,7 @@ use codex_rollout::state_db;
+ use codex_state::log_db;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
++use codex_utils_cli::prepare_project_home;
+ use codex_utils_home_dir::find_codex_home;
+ use codex_utils_oss::ensure_oss_provider_ready;
+ use codex_utils_oss::get_default_model_for_oss_provider;
+@@ -879,7 +880,7 @@ pub async fn run_main(
+     let raw_overrides = cli.config_overrides.raw_overrides.clone();
+     // `oss` model provider.
+     let overrides_cli = codex_utils_cli::CliConfigOverrides { raw_overrides };
+-    let cli_kv_overrides = match overrides_cli.parse_overrides() {
++    let mut cli_kv_overrides = match overrides_cli.parse_overrides() {
+         // Parse `-c` overrides from the CLI.
+         Ok(v) => v,
+         #[allow(clippy::print_stderr)]
+@@ -888,28 +889,52 @@ pub async fn run_main(
+             std::process::exit(1);
+         }
+     };
++    if cli.avalai {
++        codex_utils_cli::prepend_avalai_cli_overrides(&mut cli_kv_overrides);
++    }
+ 
+     // we load config.toml here to determine project state.
+     #[allow(clippy::print_stderr)]
+     let profile_auth_launch = cli.profile_auth_launch.clone();
++    let base_codex_home = match find_codex_home() {
++        Ok(codex_home) => codex_home.to_path_buf(),
++        #[allow(clippy::print_stderr)]
++        Err(err) => {
++            eprintln!("Error finding codex home: {err}");
++            std::process::exit(1);
++        }
++    };
++    let project_dir = cli.project_dir.as_deref().or(cli.cwd.as_deref());
++    let project_launch = if profile_auth_launch.is_none() {
++        cli.project
++            .as_deref()
++            .map(|project_id| prepare_project_home(&base_codex_home, project_id, project_dir))
++            .transpose()?
++    } else {
++        None
++    };
+     let codex_home = if let Some(launch) = profile_auth_launch.as_ref() {
+         launch.codex_home.clone()
+     } else {
+-        match find_codex_home() {
+-            Ok(codex_home) => codex_home.to_path_buf(),
+-            #[allow(clippy::print_stderr)]
+-            Err(err) => {
+-                eprintln!("Error finding codex home: {err}");
+-                std::process::exit(1);
+-            }
+-        }
++        project_launch
++            .as_ref()
++            .map(|launch| launch.codex_home.clone())
++            .unwrap_or_else(|| base_codex_home.clone())
+     };
++    let config_source_home = project_launch
++        .as_ref()
++        .map(|launch| launch.base_codex_home.as_path())
++        .unwrap_or(codex_home.as_path());
+ 
+     let mut launch_loader_overrides = loader_overrides.clone();
+     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
+-        let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
++        let user_config_path = resolve_profile_v2_config_path(config_source_home, profile_v2);
+         launch_loader_overrides.user_config_path = Some(user_config_path);
+         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
++    } else if project_launch.is_some() {
++        launch_loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(
++            config_source_home.join("config.toml"),
++        )?);
+     }
+     let reuse_implicit_local_daemon = can_reuse_implicit_local_daemon(
+         &cli_kv_overrides,
+@@ -949,9 +974,13 @@ pub async fn run_main(
+         config_cwd_for_app_server_target(cwd.as_deref(), &app_server_target, &environment_manager)?;
+     let mut loader_overrides = loader_overrides;
+     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
+-        let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
++        let user_config_path = resolve_profile_v2_config_path(config_source_home, profile_v2);
+         loader_overrides.user_config_path = Some(user_config_path);
+         loader_overrides.user_config_profile = Some(profile_v2.clone());
++    } else if project_launch.is_some() {
++        loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(
++            config_source_home.join("config.toml"),
++        )?);
+     }
+ 
+     let bootstrap_config = load_bootstrap_config_or_exit(
+diff --git a/codex-rs/tui/src/session_archive_commands.rs b/codex-rs/tui/src/session_archive_commands.rs
+index d3e728f5..191fe7bd 100644
+--- a/codex-rs/tui/src/session_archive_commands.rs
++++ b/codex-rs/tui/src/session_archive_commands.rs
+@@ -27,7 +27,10 @@ use codex_config::LoaderOverrides;
+ use codex_exec_server::EnvironmentManager;
+ use codex_exec_server::ExecServerRuntimePaths;
+ use codex_protocol::ThreadId;
++use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_cli::CliConfigOverrides;
++use codex_utils_cli::prepare_project_home;
++use codex_utils_cli::prepend_avalai_cli_overrides;
+ use codex_utils_home_dir::find_codex_home;
+ use codex_utils_oss::get_default_model_for_oss_provider;
+ use color_eyre::eyre::Result;
+@@ -254,18 +257,40 @@ async fn start_app_server_for_archive_command(
+     let strict_config = cli.strict_config;
+     let raw_overrides = cli.config_overrides.raw_overrides.clone();
+     let overrides_cli = CliConfigOverrides { raw_overrides };
+-    let cli_kv_overrides = overrides_cli
++    let mut cli_kv_overrides = overrides_cli
+         .parse_overrides()
+         .map_err(|err| eyre!("failed to parse -c overrides: {err}"))?;
+-    let codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
++    if cli.avalai {
++        prepend_avalai_cli_overrides(&mut cli_kv_overrides);
++    }
++    let base_codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
++    let project_dir = cli.project_dir.as_deref().or(cli.cwd.as_deref());
++    let project_launch = cli
++        .project
++        .as_deref()
++        .map(|project_id| prepare_project_home(base_codex_home.as_path(), project_id, project_dir))
++        .transpose()
++        .wrap_err("failed to prepare project home")?;
++    let codex_home = project_launch
++        .as_ref()
++        .map(|launch| launch.codex_home.clone())
++        .unwrap_or_else(|| base_codex_home.to_path_buf());
++    let config_source_home = project_launch
++        .as_ref()
++        .map(|launch| launch.base_codex_home.as_path())
++        .unwrap_or(codex_home.as_path());
+ 
+     let mut launch_loader_overrides = loader_overrides.clone();
+     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
+         launch_loader_overrides.user_config_path = Some(resolve_profile_v2_config_path(
+-            codex_home.as_path(),
++            config_source_home,
+             profile_v2,
+         ));
+         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
++    } else if project_launch.is_some() {
++        launch_loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(
++            config_source_home.join("config.toml"),
++        )?);
+     }
+ 
+     let reuse_implicit_local_daemon = super::can_reuse_implicit_local_daemon(
+@@ -308,10 +333,14 @@ async fn start_app_server_for_archive_command(
+     let mut loader_overrides = loader_overrides;
+     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
+         loader_overrides.user_config_path = Some(resolve_profile_v2_config_path(
+-            codex_home.as_path(),
++            config_source_home,
+             profile_v2,
+         ));
+         loader_overrides.user_config_profile = Some(profile_v2.clone());
++    } else if project_launch.is_some() {
++        loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(
++            config_source_home.join("config.toml"),
++        )?);
+     }
+ 
+     let bootstrap_config = load_config_toml_with_layer_stack(
+@@ -362,6 +391,7 @@ async fn start_app_server_for_archive_command(
+     });
+     let cwd = cli.cwd.clone();
+     let config = ConfigBuilder::default()
++        .codex_home(codex_home.clone())
+         .cli_overrides(cli_kv_overrides.clone())
+         .harness_overrides(ConfigOverrides {
+             model,
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index 646380a2..78b81f52 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -49,6 +49,8 @@ pub enum SlashCommand {
+     Mention,
+     Status,
+     Usage,
++    #[strum(to_string = "refresh-profiles", serialize = "refresh-profile")]
++    RefreshProfile,
+     DebugConfig,
+     Title,
+     Statusline,
+@@ -104,6 +106,9 @@ impl SlashCommand {
+             SlashCommand::Hooks => "view and manage lifecycle hooks",
+             SlashCommand::Status => "show current session configuration and token usage",
+             SlashCommand::Usage => "view account usage or use a usage limit reset",
++            SlashCommand::RefreshProfile => {
++                "switch to the next managed profile when started with --best"
++            }
+             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
+             SlashCommand::Title => "configure which items appear in the terminal title",
+             SlashCommand::Statusline => "configure which items appear in the status line",
+@@ -180,6 +185,7 @@ impl SlashCommand {
+                 | SlashCommand::Mention
+                 | SlashCommand::Status
+                 | SlashCommand::Usage
++                | SlashCommand::RefreshProfile
+                 | SlashCommand::Ide
+         )
+     }
+@@ -219,6 +225,7 @@ impl SlashCommand {
+             | SlashCommand::Hooks
+             | SlashCommand::Status
+             | SlashCommand::Usage
++            | SlashCommand::RefreshProfile
+             | SlashCommand::DebugConfig
+             | SlashCommand::Ps
+             | SlashCommand::Stop
+@@ -305,4 +312,17 @@ mod tests {
+             Ok(SlashCommand::AutoReview)
+         );
+     }
++
++    #[test]
++    fn refresh_profile_command_uses_dash_name() {
++        assert_eq!(SlashCommand::RefreshProfile.command(), "refresh-profiles");
++        assert_eq!(
++            SlashCommand::from_str("refresh-profiles"),
++            Ok(SlashCommand::RefreshProfile)
++        );
++        assert_eq!(
++            SlashCommand::from_str("refresh-profile"),
++            Ok(SlashCommand::RefreshProfile)
++        );
++    }
+ }
+diff --git a/codex-rs/utils/cli/src/lib.rs b/codex-rs/utils/cli/src/lib.rs
+index 633638e7..ff5825c4 100644
+--- a/codex-rs/utils/cli/src/lib.rs
++++ b/codex-rs/utils/cli/src/lib.rs
+@@ -1,6 +1,8 @@
+ mod approval_mode_cli_arg;
+ mod config_override;
+ pub(crate) mod format_env_display;
++mod model_provider_shortcuts;
++mod project_home;
+ mod resume_command;
+ mod sandbox_mode_cli_arg;
+ mod shared_options;
+@@ -9,6 +11,16 @@ pub use approval_mode_cli_arg::ApprovalModeCliArg;
+ pub use codex_protocol::config_types::ProfileV2Name;
+ pub use config_override::CliConfigOverrides;
+ pub use format_env_display::format_env_display;
++pub use model_provider_shortcuts::AVALAI_API_KEY_ENV_VAR;
++pub use model_provider_shortcuts::AVALAI_DEFAULT_BASE_URL;
++pub use model_provider_shortcuts::AVALAI_DEFAULT_MODEL;
++pub use model_provider_shortcuts::AVALAI_ENV_KEY_INSTRUCTIONS;
++pub use model_provider_shortcuts::AVALAI_PROVIDER_ID;
++pub use model_provider_shortcuts::avalai_cli_overrides;
++pub use model_provider_shortcuts::prepend_avalai_cli_overrides;
++pub use project_home::ProjectHomeLaunch;
++pub use project_home::prepare_project_home;
++pub use project_home::project_home_for_base;
+ pub use resume_command::resume_command;
+ pub use resume_command::resume_hint;
+ pub use sandbox_mode_cli_arg::SandboxModeCliArg;
+diff --git a/codex-rs/utils/cli/src/model_provider_shortcuts.rs b/codex-rs/utils/cli/src/model_provider_shortcuts.rs
+new file mode 100644
+index 00000000..7da07937
+--- /dev/null
++++ b/codex-rs/utils/cli/src/model_provider_shortcuts.rs
+@@ -0,0 +1,59 @@
++use toml::Value as TomlValue;
++
++pub const AVALAI_PROVIDER_ID: &str = "avalai";
++pub const AVALAI_DEFAULT_MODEL: &str = "deepseek-v4-pro";
++pub const AVALAI_DEFAULT_BASE_URL: &str = "https://api.avalai.ir/v1";
++pub const AVALAI_API_KEY_ENV_VAR: &str = "AVALAI_API_KEY";
++pub const AVALAI_ENV_KEY_INSTRUCTIONS: &str =
++    "Set the AVALAI_API_KEY environment variable to your AvalAI API key.";
++
++pub fn avalai_cli_overrides() -> Vec<(String, TomlValue)> {
++    vec![
++        (
++            "model_provider".to_string(),
++            TomlValue::String(AVALAI_PROVIDER_ID.to_string()),
++        ),
++        (
++            "model".to_string(),
++            TomlValue::String(AVALAI_DEFAULT_MODEL.to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.name"),
++            TomlValue::String("AvalAI".to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.base_url"),
++            TomlValue::String(AVALAI_DEFAULT_BASE_URL.to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.env_key"),
++            TomlValue::String(AVALAI_API_KEY_ENV_VAR.to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.env_key_instructions"),
++            TomlValue::String(AVALAI_ENV_KEY_INSTRUCTIONS.to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.wire_api"),
++            TomlValue::String("responses".to_string()),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.requires_openai_auth"),
++            TomlValue::Boolean(false),
++        ),
++        (
++            format!("model_providers.{AVALAI_PROVIDER_ID}.supports_websockets"),
++            TomlValue::Boolean(false),
++        ),
++    ]
++}
++
++pub fn prepend_avalai_cli_overrides(overrides: &mut Vec<(String, TomlValue)>) {
++    let mut avalai_overrides = avalai_cli_overrides();
++    avalai_overrides.append(overrides);
++    *overrides = avalai_overrides;
++}
++
++#[cfg(test)]
++#[path = "model_provider_shortcuts_tests.rs"]
++mod tests;
+diff --git a/codex-rs/utils/cli/src/model_provider_shortcuts_tests.rs b/codex-rs/utils/cli/src/model_provider_shortcuts_tests.rs
+new file mode 100644
+index 00000000..3c6dad18
+--- /dev/null
++++ b/codex-rs/utils/cli/src/model_provider_shortcuts_tests.rs
+@@ -0,0 +1,78 @@
++use pretty_assertions::assert_eq;
++use toml::Value as TomlValue;
++
++use super::*;
++
++#[test]
++fn avalai_overrides_define_openai_compatible_provider() {
++    let overrides = avalai_cli_overrides();
++
++    assert_eq!(
++        overrides,
++        vec![
++            (
++                "model_provider".to_string(),
++                TomlValue::String("avalai".to_string())
++            ),
++            (
++                "model".to_string(),
++                TomlValue::String("deepseek-v4-pro".to_string())
++            ),
++            (
++                "model_providers.avalai.name".to_string(),
++                TomlValue::String("AvalAI".to_string())
++            ),
++            (
++                "model_providers.avalai.base_url".to_string(),
++                TomlValue::String("https://api.avalai.ir/v1".to_string())
++            ),
++            (
++                "model_providers.avalai.env_key".to_string(),
++                TomlValue::String("AVALAI_API_KEY".to_string())
++            ),
++            (
++                "model_providers.avalai.env_key_instructions".to_string(),
++                TomlValue::String(
++                    "Set the AVALAI_API_KEY environment variable to your AvalAI API key."
++                        .to_string()
++                )
++            ),
++            (
++                "model_providers.avalai.wire_api".to_string(),
++                TomlValue::String("responses".to_string())
++            ),
++            (
++                "model_providers.avalai.requires_openai_auth".to_string(),
++                TomlValue::Boolean(false)
++            ),
++            (
++                "model_providers.avalai.supports_websockets".to_string(),
++                TomlValue::Boolean(false)
++            ),
++        ]
++    );
++}
++
++#[test]
++fn prepend_avalai_overrides_keeps_user_overrides_last() {
++    let mut overrides = vec![
++        (
++            "model_providers.avalai.base_url".to_string(),
++            TomlValue::String("https://avalai.example.test/v1".to_string()),
++        ),
++        (
++            "model".to_string(),
++            TomlValue::String("user-selected-model".to_string()),
++        ),
++    ];
++
++    prepend_avalai_cli_overrides(&mut overrides);
++
++    assert_eq!(
++        overrides.last(),
++        Some(&(
++            "model".to_string(),
++            TomlValue::String("user-selected-model".to_string())
++        ))
++    );
++}
+diff --git a/codex-rs/utils/cli/src/project_home.rs b/codex-rs/utils/cli/src/project_home.rs
+new file mode 100644
+index 00000000..f8e87714
+--- /dev/null
++++ b/codex-rs/utils/cli/src/project_home.rs
+@@ -0,0 +1,198 @@
++use std::fs;
++use std::io;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++
++const PROJECTS_DIR: &str = "projects";
++const HOMES_DIR: &str = "homes";
++const PROJECT_ROOT_FILE: &str = ".codex-project-root";
++const PROFILE_PROJECT_ROOT_FILE: &str = ".codex-profile-project-root";
++const PROJECT_ID_FILE: &str = ".codex-project-id";
++const PROJECT_SOURCE_HOME_FILE: &str = ".codex-project-source-home";
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ProjectHomeLaunch {
++    pub codex_home: PathBuf,
++    pub base_codex_home: PathBuf,
++    pub project_id: String,
++    pub project_root: PathBuf,
++}
++
++pub fn prepare_project_home(
++    base_codex_home: &Path,
++    project_id: &str,
++    project_dir: Option<&Path>,
++) -> io::Result<ProjectHomeLaunch> {
++    validate_project_id(project_id)?;
++    let project_root = resolve_project_root(project_dir)?;
++    let codex_home = project_home_for_base(base_codex_home, project_id);
++
++    fs::create_dir_all(&codex_home)?;
++    restrict_dir(&codex_home)?;
++
++    ensure_project_root_marker(&codex_home, &project_root)?;
++    write_private_file(
++        &codex_home.join(PROJECT_ID_FILE),
++        format!("{project_id}\n").as_bytes(),
++    )?;
++    write_private_file(
++        &codex_home.join(PROJECT_SOURCE_HOME_FILE),
++        format!("{}\n", base_codex_home.display()).as_bytes(),
++    )?;
++    copy_auth_if_present(base_codex_home, &codex_home)?;
++
++    Ok(ProjectHomeLaunch {
++        codex_home,
++        base_codex_home: base_codex_home.to_path_buf(),
++        project_id: project_id.to_string(),
++        project_root,
++    })
++}
++
++pub fn project_home_for_base(base_codex_home: &Path, project_id: &str) -> PathBuf {
++    if let Some(profile_root) = managed_profile_root(base_codex_home) {
++        return profile_root.join(PROJECTS_DIR).join(project_id);
++    }
++    base_codex_home.join(PROJECTS_DIR).join(project_id)
++}
++
++fn managed_profile_root(base_codex_home: &Path) -> Option<&Path> {
++    let homes_dir = base_codex_home.parent()?;
++    if homes_dir.file_name()? != HOMES_DIR {
++        return None;
++    }
++    homes_dir.parent()
++}
++
++fn validate_project_id(project_id: &str) -> io::Result<()> {
++    let mut chars = project_id.chars();
++    let Some(first) = chars.next() else {
++        return Err(invalid_input("project id cannot be empty"));
++    };
++    if !first.is_ascii_alphanumeric() {
++        return Err(invalid_input(format!(
++            "invalid project id `{project_id}`: must start with an ASCII letter or digit"
++        )));
++    }
++    if project_id.len() > 64 {
++        return Err(invalid_input(format!(
++            "invalid project id `{project_id}`: must be 64 bytes or fewer"
++        )));
++    }
++    if chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')) {
++        Ok(())
++    } else {
++        Err(invalid_input(format!(
++            "invalid project id `{project_id}`: use only ASCII letters, digits, '.', '_' or '-'"
++        )))
++    }
++}
++
++fn resolve_project_root(dir: Option<&Path>) -> io::Result<PathBuf> {
++    let start = match dir {
++        Some(dir) => dir.to_path_buf(),
++        None => std::env::current_dir()?,
++    };
++    Ok(git_root(&start)?.unwrap_or_else(|| start.canonicalize().unwrap_or(start)))
++}
++
++fn git_root(dir: &Path) -> io::Result<Option<PathBuf>> {
++    let output = Command::new("git")
++        .arg("-C")
++        .arg(dir)
++        .arg("rev-parse")
++        .arg("--show-toplevel")
++        .output();
++    match output {
++        Ok(output) if output.status.success() => {
++            let root = String::from_utf8(output.stdout)
++                .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
++            Ok(Some(PathBuf::from(root.trim())))
++        }
++        Ok(_) => Ok(None),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err),
++    }
++}
++
++fn ensure_project_root_marker(codex_home: &Path, project_root: &Path) -> io::Result<()> {
++    let expected = project_root.to_string_lossy();
++    for marker in [PROJECT_ROOT_FILE, PROFILE_PROJECT_ROOT_FILE] {
++        let path = codex_home.join(marker);
++        match fs::read_to_string(&path) {
++            Ok(existing) if existing.trim() != expected => {
++                return Err(invalid_input(format!(
++                    "project id is already bound to {}; choose another id or remove {}",
++                    existing.trim(),
++                    codex_home.display()
++                )));
++            }
++            Ok(_) => {}
++            Err(err) if err.kind() == ErrorKind::NotFound => {}
++            Err(err) => return Err(err),
++        }
++    }
++    write_private_file(
++        &codex_home.join(PROJECT_ROOT_FILE),
++        format!("{expected}\n").as_bytes(),
++    )
++}
++
++fn copy_auth_if_present(base_codex_home: &Path, project_codex_home: &Path) -> io::Result<()> {
++    let auth_source = base_codex_home.join("auth.json");
++    let auth_dest = project_codex_home.join("auth.json");
++    if auth_source == auth_dest {
++        return Ok(());
++    }
++    match fs::copy(&auth_source, &auth_dest) {
++        Ok(_) => restrict_file(&auth_dest),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
++        Err(err) => Err(err),
++    }
++}
++
++fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
++    if let Some(parent) = path.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    fs::write(path, contents)?;
++    restrict_file(path)
++}
++
++fn restrict_dir(path: &Path) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++
++        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = path;
++    }
++    Ok(())
++}
++
++fn restrict_file(path: &Path) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++
++        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = path;
++    }
++    Ok(())
++}
++
++fn invalid_input(message: impl Into<String>) -> io::Error {
++    io::Error::new(ErrorKind::InvalidInput, message.into())
++}
++
++#[cfg(test)]
++#[path = "project_home_tests.rs"]
++mod tests;
+diff --git a/codex-rs/utils/cli/src/project_home_tests.rs b/codex-rs/utils/cli/src/project_home_tests.rs
+new file mode 100644
+index 00000000..62fbe4f6
+--- /dev/null
++++ b/codex-rs/utils/cli/src/project_home_tests.rs
+@@ -0,0 +1,114 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++#[test]
++fn prepare_project_home_creates_home_and_copies_auth() -> io::Result<()> {
++    let temp = TempTree::new("creates-home")?;
++    let base_home = temp.path().join("codex-home");
++    let workspace = temp.path().join("workspace");
++    fs::create_dir_all(&base_home)?;
++    fs::create_dir_all(&workspace)?;
++    fs::write(base_home.join("auth.json"), "{\"OPENAI_API_KEY\":\"test\"}")?;
++
++    let launch = prepare_project_home(&base_home, "demo", Some(&workspace))?;
++
++    assert_eq!(launch.codex_home, base_home.join("projects").join("demo"));
++    assert_eq!(launch.base_codex_home, base_home);
++    assert_eq!(launch.project_id, "demo");
++    assert_eq!(launch.project_root, workspace.canonicalize()?);
++    assert_eq!(
++        fs::read_to_string(launch.codex_home.join("auth.json"))?,
++        "{\"OPENAI_API_KEY\":\"test\"}"
++    );
++    assert_eq!(
++        fs::read_to_string(launch.codex_home.join(PROJECT_ROOT_FILE))?,
++        format!("{}\n", workspace.canonicalize()?.display())
++    );
++
++    Ok(())
++}
++
++#[test]
++fn prepare_project_home_uses_managed_profiles_project_dir() -> io::Result<()> {
++    let temp = TempTree::new("managed-profile")?;
++    let profiles_root = temp.path().join("codex-switch");
++    let base_home = profiles_root.join("homes").join("account-a");
++    let workspace = temp.path().join("workspace");
++    fs::create_dir_all(&base_home)?;
++    fs::create_dir_all(&workspace)?;
++
++    let launch = prepare_project_home(&base_home, "demo", Some(&workspace))?;
++
++    assert_eq!(
++        launch.codex_home,
++        profiles_root.join("projects").join("demo")
++    );
++    assert_eq!(
++        fs::read_to_string(launch.codex_home.join(PROJECT_SOURCE_HOME_FILE))?,
++        format!("{}\n", base_home.display())
++    );
++
++    Ok(())
++}
++
++#[test]
++fn prepare_project_home_rejects_project_id_reuse_for_different_root() -> io::Result<()> {
++    let temp = TempTree::new("root-mismatch")?;
++    let base_home = temp.path().join("codex-home");
++    let workspace_a = temp.path().join("workspace-a");
++    let workspace_b = temp.path().join("workspace-b");
++    fs::create_dir_all(&base_home)?;
++    fs::create_dir_all(&workspace_a)?;
++    fs::create_dir_all(&workspace_b)?;
++
++    prepare_project_home(&base_home, "demo", Some(&workspace_a))?;
++    let err = prepare_project_home(&base_home, "demo", Some(&workspace_b))
++        .expect_err("project id should stay bound to its first root");
++
++    assert_eq!(err.kind(), ErrorKind::InvalidInput);
++    assert!(err.to_string().contains("project id is already bound"));
++
++    Ok(())
++}
++
++#[test]
++fn prepare_project_home_rejects_invalid_project_id() -> io::Result<()> {
++    let temp = TempTree::new("invalid-id")?;
++    let err = prepare_project_home(temp.path(), "../bad", None)
++        .expect_err("path-like project ids should be rejected");
++
++    assert_eq!(err.kind(), ErrorKind::InvalidInput);
++
++    Ok(())
++}
++
++struct TempTree {
++    path: PathBuf,
++}
++
++impl TempTree {
++    fn new(name: &str) -> io::Result<Self> {
++        let nanos = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map(|duration| duration.as_nanos())
++            .unwrap_or(0);
++        let path = std::env::temp_dir().join(format!(
++            "codex-project-home-{name}-{}-{nanos}",
++            std::process::id()
++        ));
++        fs::create_dir_all(&path)?;
++        Ok(Self { path })
++    }
++
++    fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for TempTree {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir_all(&self.path);
++    }
++}
+diff --git a/codex-rs/utils/cli/src/shared_options.rs b/codex-rs/utils/cli/src/shared_options.rs
+index 839b32cc..4cde8891 100644
+--- a/codex-rs/utils/cli/src/shared_options.rs
++++ b/codex-rs/utils/cli/src/shared_options.rs
+@@ -25,6 +25,10 @@ pub struct SharedCliOptions {
+     #[arg(long = "oss", default_value_t = false)]
+     pub oss: bool,
+ 
++    /// Use AvalAI's OpenAI-compatible Responses endpoint.
++    #[arg(long = "avalai", default_value_t = false, conflicts_with_all = ["oss", "oss_provider"])]
++    pub avalai: bool,
++
+     /// Specify which local provider to use (lmstudio or ollama).
+     /// If not specified with --oss, will use config default or show selection.
+     #[arg(long = "local-provider")]
+@@ -34,6 +38,14 @@ pub struct SharedCliOptions {
+     #[arg(long = "profile", short = 'p')]
+     pub config_profile_v2: Option<ProfileV2Name>,
+ 
++    /// Use a durable project-scoped Codex home for sessions, memories, and related state.
++    #[arg(long = "project", value_name = "ID")]
++    pub project: Option<String>,
++
++    /// Directory whose repository/root should be bound to --project. Defaults to --cd or cwd.
++    #[arg(long = "project-dir", value_name = "DIR", requires = "project")]
++    pub project_dir: Option<PathBuf>,
++
+     /// Select the sandbox policy to use when executing model-generated shell
+     /// commands.
+     #[arg(long = "sandbox", short = 's')]
+@@ -70,8 +82,11 @@ impl SharedCliOptions {
+             images,
+             model,
+             oss,
++            avalai,
+             oss_provider,
+             config_profile_v2,
++            project,
++            project_dir,
+             sandbox_mode,
+             dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust,
+@@ -82,8 +97,11 @@ impl SharedCliOptions {
+             images: root_images,
+             model: root_model,
+             oss: root_oss,
++            avalai: root_avalai,
+             oss_provider: root_oss_provider,
+             config_profile_v2: root_config_profile_v2,
++            project: root_project,
++            project_dir: root_project_dir,
+             sandbox_mode: root_sandbox_mode,
+             dangerously_bypass_approvals_and_sandbox: root_dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust: root_bypass_hook_trust,
+@@ -94,15 +112,24 @@ impl SharedCliOptions {
+         if model.is_none() {
+             model.clone_from(root_model);
+         }
+-        if *root_oss {
++        if *root_avalai && !*oss {
++            *avalai = true;
++        }
++        if *root_oss && !*avalai {
+             *oss = true;
+         }
+-        if oss_provider.is_none() {
++        if oss_provider.is_none() && !*avalai {
+             oss_provider.clone_from(root_oss_provider);
+         }
+         if config_profile_v2.is_none() {
+             config_profile_v2.clone_from(root_config_profile_v2);
+         }
++        if project.is_none() {
++            project.clone_from(root_project);
++        }
++        if project_dir.is_none() {
++            project_dir.clone_from(root_project_dir);
++        }
+         if sandbox_mode.is_none() {
+             *sandbox_mode = *root_sandbox_mode;
+         }
+@@ -135,8 +162,11 @@ impl SharedCliOptions {
+             images,
+             model,
+             oss,
++            avalai,
+             oss_provider,
+             config_profile_v2,
++            project,
++            project_dir,
+             sandbox_mode,
+             dangerously_bypass_approvals_and_sandbox,
+             bypass_hook_trust,
+@@ -147,8 +177,14 @@ impl SharedCliOptions {
+         if let Some(model) = model {
+             self.model = Some(model);
+         }
++        if avalai {
++            self.avalai = true;
++            self.oss = false;
++            self.oss_provider = None;
++        }
+         if oss {
+             self.oss = true;
++            self.avalai = false;
+         }
+         if let Some(oss_provider) = oss_provider {
+             self.oss_provider = Some(oss_provider);
+@@ -156,6 +192,12 @@ impl SharedCliOptions {
+         if let Some(config_profile_v2) = config_profile_v2 {
+             self.config_profile_v2 = Some(config_profile_v2);
+         }
++        if let Some(project) = project {
++            self.project = Some(project);
++        }
++        if let Some(project_dir) = project_dir {
++            self.project_dir = Some(project_dir);
++        }
+         if subcommand_selected_sandbox_mode {
+             self.sandbox_mode = sandbox_mode;
+             self.dangerously_bypass_approvals_and_sandbox =
+-- 
+2.51.0
+

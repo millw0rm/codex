@@ -1,0 +1,102 @@
+From 278d94d84c68a376efae5d4d6f3de1e38768996a Mon Sep 17 00:00:00 2001
+From: your name <you@exampl.ecom>
+Date: Thu, 2 Jul 2026 22:23:13 +0330
+Subject: [PATCH 2/7] Expose profile manager under codex profiles
+
+---
+ codex-rs/cli/src/main.rs                | 26 +++++++++++++++++++++++++
+ codex-rs/cli/src/profile_manager_cmd.rs | 13 +++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 84542866..6608a76a 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -147,6 +147,9 @@ enum Subcommand {
+     /// [experimental] Manage a portable pool of Codex account profiles.
+     Pool(ProfilePoolCli),
+ 
++    /// Manage self-contained Codex account profile homes.
++    Profiles(codex_cli::profile_manager_cmd::ProfilesArgs),
++
+     /// Start Codex as an MCP server (stdio).
+     McpServer(McpServerCommand),
+ 
+@@ -1122,6 +1125,14 @@ async fn cli_main(
+                 .map_err(anyhow::Error::msg)?;
+             profile_pool_cmd::run(pool_cli, cli_overrides).await?;
+         }
++        Some(Subcommand::Profiles(profiles_cli)) => {
++            reject_remote_mode_for_subcommand(
++                root_remote.as_deref(),
++                root_remote_auth_token_env.as_deref(),
++                "profiles",
++            )?;
++            profiles_cli.run()?;
++        }
+         Some(Subcommand::AppServer(app_server_cli)) => {
+             let AppServerCommand {
+                 subcommand,
+@@ -2171,6 +2182,7 @@ fn unsupported_subcommand_name_for_strict_config(
+         Some(Subcommand::Mcp(_)) => Some("mcp"),
+         Some(Subcommand::Plugin(_)) => Some("plugin"),
+         Some(Subcommand::Pool(_)) => Some("pool"),
++        Some(Subcommand::Profiles(_)) => Some("profiles"),
+         #[cfg(any(target_os = "macos", target_os = "windows"))]
+         Some(Subcommand::App(_)) => Some("app"),
+         Some(Subcommand::Login(_)) => Some("login"),
+@@ -2975,6 +2987,20 @@ mod tests {
+         assert!(cli.subcommand.is_none());
+     }
+ 
++    #[test]
++    fn profiles_add_parses_under_codex() {
++        let cli = MultitoolCli::try_parse_from([
++            "codex",
++            "profiles",
++            "add",
++            "work-account",
++            "--no-login",
++        ])
++        .expect("parse");
++
++        assert!(matches!(cli.subcommand, Some(Subcommand::Profiles(_))));
++    }
++
+     #[test]
+     fn archive_merges_scoped_tui_flags() {
+         let (target, interactive, remote) = finalize_archive_from_args(
+diff --git a/codex-rs/cli/src/profile_manager_cmd.rs b/codex-rs/cli/src/profile_manager_cmd.rs
+index 6dd696ae..d62478c7 100644
+--- a/codex-rs/cli/src/profile_manager_cmd.rs
++++ b/codex-rs/cli/src/profile_manager_cmd.rs
+@@ -54,6 +54,13 @@ mod tests;
+     about = "Manage self-contained Codex profile homes"
+ )]
+ pub struct ProfilesCli {
++    #[command(flatten)]
++    args: ProfilesArgs,
++}
++
++/// Arguments for managing self-contained Codex profile homes.
++#[derive(Debug, Args)]
++pub struct ProfilesArgs {
+     /// Root directory for all managed profile state.
+     #[arg(long, env = "CODEX_PROFILES_DIR", value_name = "DIR")]
+     root: Option<PathBuf>,
+@@ -249,6 +256,12 @@ impl ProfilesCli {
+     }
+ 
+     fn run(self) -> anyhow::Result<()> {
++        self.args.run()
++    }
++}
++
++impl ProfilesArgs {
++    pub fn run(self) -> anyhow::Result<()> {
+         let root = ProfilesRoot::new(resolve_root(self.root)?);
+         let codex_bin = resolve_codex_bin(self.codex_bin);
+         match self.command {
+-- 
+2.51.0
+

@@ -1,0 +1,1078 @@
+From 759f772046b8048265f6ef2add529f9e9e9eef89 Mon Sep 17 00:00:00 2001
+From: your name <you@exampl.ecom>
+Date: Fri, 3 Jul 2026 10:30:29 +0330
+Subject: [PATCH 6/7] feat: add cursor session MCP tool
+
+---
+ codex-rs/mcp-server/src/codex_tool_config.rs  |   2 +-
+ codex-rs/mcp-server/src/cursor_session.rs     | 453 ++++++++++++++++++
+ .../mcp-server/src/cursor_session_tests.rs    | 225 +++++++++
+ codex-rs/mcp-server/src/lib.rs                |   2 +
+ codex-rs/mcp-server/src/message_processor.rs  |  13 +
+ .../mcp-server/tests/common/mcp_process.rs    |  49 +-
+ .../tests/suite/cursor_session_tool.rs        | 176 +++++++
+ codex-rs/mcp-server/tests/suite/mod.rs        |   1 +
+ 8 files changed, 909 insertions(+), 12 deletions(-)
+ create mode 100644 codex-rs/mcp-server/src/cursor_session.rs
+ create mode 100644 codex-rs/mcp-server/src/cursor_session_tests.rs
+ create mode 100644 codex-rs/mcp-server/tests/suite/cursor_session_tool.rs
+
+diff --git a/codex-rs/mcp-server/src/codex_tool_config.rs b/codex-rs/mcp-server/src/codex_tool_config.rs
+index 531c8f80..d7dafa2e 100644
+--- a/codex-rs/mcp-server/src/codex_tool_config.rs
++++ b/codex-rs/mcp-server/src/codex_tool_config.rs
+@@ -242,7 +242,7 @@ pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
+     .with_raw_output_schema(codex_tool_output_schema())
+ }
+ 
+-fn create_tool_input_schema(
++pub(crate) fn create_tool_input_schema(
+     schema: schemars::schema::RootSchema,
+     panic_message: &str,
+ ) -> Arc<JsonObject> {
+diff --git a/codex-rs/mcp-server/src/cursor_session.rs b/codex-rs/mcp-server/src/cursor_session.rs
+new file mode 100644
+index 00000000..39d6fdd0
+--- /dev/null
++++ b/codex-rs/mcp-server/src/cursor_session.rs
+@@ -0,0 +1,453 @@
++//! Cursor Agent login-profile MCP tool.
++
++use std::collections::HashMap;
++use std::ffi::OsString;
++use std::io::Read;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++use std::process::Stdio;
++use std::str::FromStr;
++use std::sync::Arc;
++use std::time::Duration;
++use std::time::Instant;
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::anyhow;
++use rmcp::model::CallToolResult;
++use rmcp::model::Content;
++use rmcp::model::JsonObject;
++use rmcp::model::Tool;
++use schemars::JsonSchema;
++use schemars::r#gen::SchemaSettings;
++use serde::Deserialize;
++use serde::Serialize;
++use serde_json::json;
++
++use crate::codex_tool_config::create_tool_input_schema;
++
++const TOOL_NAME: &str = "cursor-session";
++const DEFAULT_CURSOR_AGENT_COMMAND: &str = "cursor-agent";
++const DEFAULT_CURSOR_SESSION_HOME: &str = "/cursor-home";
++const DEFAULT_CURSOR_SESSION_MODE: &str = "ask";
++const DEFAULT_CURSOR_SESSION_MODEL: &str = "auto";
++const DEFAULT_TIMEOUT_SECONDS: u64 = 900;
++const DEFAULT_OUTPUT_MAX_BYTES: usize = 16_000;
++const MAX_OUTPUT_MAX_BYTES: usize = 16_000;
++const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
++
++/// Client-supplied configuration for the `cursor-session` tool-call.
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++#[serde(rename_all = "kebab-case", deny_unknown_fields)]
++#[schemars(deny_unknown_fields)]
++pub struct CursorSessionToolCallParam {
++    /// The task or question to send to Cursor Agent.
++    pub prompt: String,
++
++    /// Working directory for Cursor Agent. Defaults to the Codex MCP server's
++    /// resolved working directory. If relative, it is resolved by the child process.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub cwd: Option<String>,
++
++    /// Cursor Agent command to execute. Defaults to CURSOR_SESSION_AGENT_COMMAND or cursor-agent.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub command: Option<String>,
++
++    /// Cursor login-profile home directory. Defaults to CURSOR_SESSION_HOME or /cursor-home.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub cursor_home: Option<String>,
++
++    /// Cursor mode. Defaults to CURSOR_SESSION_MODE or ask.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub mode: Option<String>,
++
++    /// Cursor model. Defaults to CURSOR_SESSION_MODEL or auto.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub model: Option<String>,
++
++    /// Maximum runtime in seconds. Defaults to CURSOR_SESSION_TIMEOUT_SECONDS or 900.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub timeout_seconds: Option<u64>,
++
++    /// Maximum stdout/stderr bytes retained from the child process, capped at 16000.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub output_max_bytes: Option<usize>,
++}
++
++/// Builds a `Tool` definition for the `cursor-session` tool-call.
++pub(crate) fn create_tool_for_cursor_session_tool_call_param() -> Tool {
++    let schema = SchemaSettings::draft2019_09()
++        .with(|s| {
++            s.inline_subschemas = true;
++            s.option_add_null_type = false;
++        })
++        .into_generator()
++        .into_root_schema_for::<CursorSessionToolCallParam>();
++
++    let input_schema =
++        create_tool_input_schema(schema, "Cursor session tool schema should serialize");
++
++    Tool::new(
++        TOOL_NAME,
++        "Ask Cursor Agent using a mounted login profile. Use this for bounded research or analysis; Codex remains responsible for planning, edits, and coordination.",
++        input_schema,
++    )
++    .with_title("Cursor Session")
++    .with_raw_output_schema(cursor_session_tool_output_schema())
++}
++
++fn cursor_session_tool_output_schema() -> Arc<JsonObject> {
++    let schema = json!({
++        "type": "object",
++        "properties": {
++            "content": { "type": "string" },
++            "stderr": { "type": "string" },
++            "exitCode": { "type": ["integer", "null"] },
++            "timedOut": { "type": "boolean" },
++            "stdoutTruncated": { "type": "boolean" },
++            "stderrTruncated": { "type": "boolean" }
++        },
++        "required": [
++            "content",
++            "stderr",
++            "exitCode",
++            "timedOut",
++            "stdoutTruncated",
++            "stderrTruncated"
++        ],
++    });
++    match schema {
++        serde_json::Value::Object(map) => Arc::new(map),
++        _ => unreachable!("json literal must be an object"),
++    }
++}
++
++pub(crate) async fn handle_cursor_session_tool_call(
++    arguments: Option<JsonObject>,
++    default_cwd: PathBuf,
++) -> CallToolResult {
++    let arguments = arguments.map(serde_json::Value::Object);
++    let params = match arguments {
++        Some(value) => match serde_json::from_value::<CursorSessionToolCallParam>(value) {
++            Ok(params) => params,
++            Err(err) => {
++                return CallToolResult::error(vec![Content::text(format!(
++                    "Failed to parse configuration for cursor-session tool: {err}"
++                ))]);
++            }
++        },
++        None => {
++            return CallToolResult::error(vec![Content::text(
++                "Missing arguments for cursor-session tool-call; the `prompt` field is required.",
++            )]);
++        }
++    };
++
++    match run_cursor_session_tool_call(params, default_cwd).await {
++        Ok(output) => output.into_call_tool_result(),
++        Err(err) => CallToolResult::error(vec![Content::text(format!(
++            "Failed to run cursor-session tool: {err}"
++        ))]),
++    }
++}
++
++async fn run_cursor_session_tool_call(
++    params: CursorSessionToolCallParam,
++    default_cwd: PathBuf,
++) -> Result<CursorSessionProcessOutput> {
++    let command = prepare_cursor_session_command(params, &default_cwd)?;
++    tokio::task::spawn_blocking(move || run_prepared_command(command))
++        .await
++        .map_err(|err| anyhow!("cursor-session task failed: {err}"))?
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PreparedCursorSessionCommand {
++    program: String,
++    args: Vec<String>,
++    cwd: PathBuf,
++    env: HashMap<OsString, OsString>,
++    timeout: Duration,
++    output_max_bytes: usize,
++}
++
++fn prepare_cursor_session_command(
++    params: CursorSessionToolCallParam,
++    default_cwd: &Path,
++) -> Result<PreparedCursorSessionCommand> {
++    let CursorSessionToolCallParam {
++        prompt,
++        cwd,
++        command,
++        cursor_home,
++        mode,
++        model,
++        timeout_seconds,
++        output_max_bytes,
++    } = params;
++
++    let command = non_empty_or_env(
++        command,
++        "CURSOR_SESSION_AGENT_COMMAND",
++        DEFAULT_CURSOR_AGENT_COMMAND,
++    );
++    let mut command_parts = shlex::split(&command)
++        .filter(|parts| !parts.is_empty())
++        .ok_or_else(|| anyhow!("CURSOR_SESSION_AGENT_COMMAND is empty or invalid"))?;
++    let program = command_parts.remove(0);
++    let cursor_home = PathBuf::from(non_empty_or_env(
++        cursor_home,
++        "CURSOR_SESSION_HOME",
++        DEFAULT_CURSOR_SESSION_HOME,
++    ));
++    let auth_file = cursor_home.join(".config").join("cursor").join("auth.json");
++    if !auth_file.is_file() {
++        return Err(anyhow!(
++            "cursor-session auth file is not available at {}",
++            auth_file.display()
++        ));
++    }
++
++    let mode = non_empty_or_env(mode, "CURSOR_SESSION_MODE", DEFAULT_CURSOR_SESSION_MODE);
++    let model = non_empty_or_env(model, "CURSOR_SESSION_MODEL", DEFAULT_CURSOR_SESSION_MODEL);
++    let timeout_seconds = timeout_seconds
++        .or_else(|| env_parsed("CURSOR_SESSION_TIMEOUT_SECONDS"))
++        .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
++    if timeout_seconds == 0 {
++        return Err(anyhow!("timeout-seconds must be greater than zero"));
++    }
++    let output_max_bytes = output_max_bytes
++        .or_else(|| env_parsed("CURSOR_SESSION_OUTPUT_MAX_BYTES"))
++        .unwrap_or(DEFAULT_OUTPUT_MAX_BYTES);
++    if output_max_bytes == 0 {
++        return Err(anyhow!("output-max-bytes must be greater than zero"));
++    }
++    let output_max_bytes = output_max_bytes.min(MAX_OUTPUT_MAX_BYTES);
++
++    let mut args = command_parts;
++    args.extend([
++        "-p".to_string(),
++        "--trust".to_string(),
++        "--mode".to_string(),
++        mode,
++        "--model".to_string(),
++        model,
++        "--output-format".to_string(),
++        "text".to_string(),
++        prompt,
++    ]);
++
++    Ok(PreparedCursorSessionCommand {
++        program,
++        args,
++        cwd: cwd
++            .map(PathBuf::from)
++            .unwrap_or_else(|| default_cwd.to_path_buf()),
++        env: cursor_session_child_env(&cursor_home),
++        timeout: Duration::from_secs(timeout_seconds),
++        output_max_bytes,
++    })
++}
++
++fn non_empty_or_env(value: Option<String>, env_key: &str, default: &str) -> String {
++    value
++        .and_then(|value| {
++            let trimmed = value.trim();
++            (!trimmed.is_empty()).then(|| trimmed.to_string())
++        })
++        .or_else(|| {
++            std::env::var(env_key)
++                .ok()
++                .filter(|value| !value.trim().is_empty())
++        })
++        .unwrap_or_else(|| default.to_string())
++}
++
++fn env_parsed<T: FromStr>(key: &str) -> Option<T> {
++    std::env::var(key).ok()?.parse().ok()
++}
++
++fn cursor_session_child_env(cursor_home: &std::path::Path) -> HashMap<OsString, OsString> {
++    let mut env = HashMap::new();
++    for key in [
++        "ALL_PROXY",
++        "PATH",
++        "LANG",
++        "LC_ALL",
++        "SSL_CERT_FILE",
++        "SSL_CERT_DIR",
++        "HTTP_PROXY",
++        "HTTPS_PROXY",
++        "NO_PROXY",
++        "all_proxy",
++        "http_proxy",
++        "https_proxy",
++        "no_proxy",
++    ] {
++        if let Some(value) = std::env::var_os(key) {
++            env.insert(OsString::from(key), value);
++        }
++    }
++
++    env.insert(
++        OsString::from("HOME"),
++        cursor_home.as_os_str().to_os_string(),
++    );
++    env.insert(
++        OsString::from("XDG_CONFIG_HOME"),
++        cursor_home.join(".config").into_os_string(),
++    );
++    env.insert(
++        OsString::from("XDG_CACHE_HOME"),
++        cursor_home.join(".cache").into_os_string(),
++    );
++    env.insert(
++        OsString::from("NPM_CONFIG_CACHE"),
++        cursor_home.join(".npm").into_os_string(),
++    );
++    env
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct CursorSessionProcessOutput {
++    stdout: LimitedOutput,
++    stderr: LimitedOutput,
++    exit_code: Option<i32>,
++    timed_out: bool,
++}
++
++impl CursorSessionProcessOutput {
++    fn success(&self) -> bool {
++        !self.timed_out && self.exit_code == Some(0)
++    }
++
++    fn into_call_tool_result(self) -> CallToolResult {
++        let stdout = self.stdout.text();
++        let stderr = self.stderr.text();
++        let model_visible_text = if stdout.trim().is_empty() && !stderr.trim().is_empty() {
++            stderr.clone()
++        } else {
++            stdout.clone()
++        };
++        let structured_content = json!({
++            "content": stdout,
++            "stderr": stderr,
++            "exitCode": self.exit_code,
++            "timedOut": self.timed_out,
++            "stdoutTruncated": self.stdout.truncated,
++            "stderrTruncated": self.stderr.truncated,
++        });
++        let mut result = if self.success() {
++            CallToolResult::success(vec![Content::text(model_visible_text)])
++        } else {
++            CallToolResult::error(vec![Content::text(model_visible_text)])
++        };
++        result.structured_content = Some(structured_content);
++        result
++    }
++}
++
++fn run_prepared_command(
++    prepared: PreparedCursorSessionCommand,
++) -> Result<CursorSessionProcessOutput> {
++    let PreparedCursorSessionCommand {
++        program,
++        args,
++        cwd,
++        env,
++        timeout,
++        output_max_bytes,
++    } = prepared;
++
++    let mut child = Command::new(&program)
++        .args(args)
++        .current_dir(&cwd)
++        .env_clear()
++        .envs(env)
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .with_context(|| format!("failed to spawn cursor-session command `{program}`"))?;
++
++    let stdout = child
++        .stdout
++        .take()
++        .ok_or_else(|| anyhow!("cursor-session stdout pipe is unavailable"))?;
++    let stderr = child
++        .stderr
++        .take()
++        .ok_or_else(|| anyhow!("cursor-session stderr pipe is unavailable"))?;
++    let stdout_reader = std::thread::spawn(move || read_limited(stdout, output_max_bytes));
++    let stderr_reader = std::thread::spawn(move || read_limited(stderr, output_max_bytes));
++
++    let started = Instant::now();
++    let (status, timed_out) = loop {
++        if let Some(status) = child.try_wait()? {
++            break (Some(status), false);
++        }
++        if started.elapsed() >= timeout {
++            let _ = child.kill();
++            let _ = child.wait();
++            break (None, true);
++        }
++        std::thread::sleep(PROCESS_POLL_INTERVAL);
++    };
++
++    let stdout = join_limited_reader(stdout_reader, "stdout")?;
++    let stderr = join_limited_reader(stderr_reader, "stderr")?;
++
++    Ok(CursorSessionProcessOutput {
++        stdout,
++        stderr,
++        exit_code: status.as_ref().and_then(std::process::ExitStatus::code),
++        timed_out,
++    })
++}
++
++fn join_limited_reader(
++    handle: std::thread::JoinHandle<std::io::Result<LimitedOutput>>,
++    stream_name: &str,
++) -> Result<LimitedOutput> {
++    handle
++        .join()
++        .map_err(|_| anyhow!("cursor-session {stream_name} reader panicked"))?
++        .with_context(|| format!("failed to read cursor-session {stream_name}"))
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct LimitedOutput {
++    bytes: Vec<u8>,
++    truncated: bool,
++}
++
++impl LimitedOutput {
++    fn text(&self) -> String {
++        String::from_utf8_lossy(&self.bytes).trim().to_string()
++    }
++}
++
++fn read_limited(mut reader: impl Read, max_bytes: usize) -> std::io::Result<LimitedOutput> {
++    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
++    let mut truncated = false;
++    let mut buffer = [0_u8; 8192];
++    loop {
++        let read = reader.read(&mut buffer)?;
++        if read == 0 {
++            break;
++        }
++        let remaining = max_bytes.saturating_sub(bytes.len());
++        if remaining > 0 {
++            bytes.extend_from_slice(&buffer[..read.min(remaining)]);
++        }
++        if read > remaining {
++            truncated = true;
++        }
++    }
++    Ok(LimitedOutput { bytes, truncated })
++}
++
++#[cfg(test)]
++#[path = "cursor_session_tests.rs"]
++mod tests;
+diff --git a/codex-rs/mcp-server/src/cursor_session_tests.rs b/codex-rs/mcp-server/src/cursor_session_tests.rs
+new file mode 100644
+index 00000000..22a2ce17
+--- /dev/null
++++ b/codex-rs/mcp-server/src/cursor_session_tests.rs
+@@ -0,0 +1,225 @@
++use std::ffi::OsString;
++use std::io::Cursor;
++
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++use super::*;
++
++#[test]
++fn cursor_session_tool_schema_is_model_visible_contract() {
++    let tool = create_tool_for_cursor_session_tool_call_param();
++    let tool_json = serde_json::to_value(&tool).expect("tool serializes");
++
++    assert_eq!(
++        "cursor-session",
++        tool_json
++            .get("name")
++            .and_then(serde_json::Value::as_str)
++            .expect("name")
++    );
++    assert_eq!(
++        Some(&serde_json::json!(["prompt"])),
++        tool_json.pointer("/inputSchema/required")
++    );
++    assert_eq!(
++        Some(&serde_json::json!(false)),
++        tool_json.pointer("/inputSchema/additionalProperties")
++    );
++    assert_eq!(
++        Some(&serde_json::json!("object")),
++        tool_json.pointer("/outputSchema/type")
++    );
++}
++
++#[test]
++fn prepare_cursor_session_command_uses_login_home_without_api_key() -> anyhow::Result<()> {
++    let root = TempDir::new()?;
++    let cursor_home = root.path().join("cursor-home");
++    let auth_dir = cursor_home.join(".config").join("cursor");
++    std::fs::create_dir_all(&auth_dir)?;
++    std::fs::write(auth_dir.join("auth.json"), "{}")?;
++    let cwd = root.path().join("workspace");
++    std::fs::create_dir(&cwd)?;
++
++    let prepared = prepare_cursor_session_command(
++        CursorSessionToolCallParam {
++            prompt: "inspect the code".to_string(),
++            cwd: Some(cwd.to_string_lossy().to_string()),
++            command: Some("cursor-agent --extra".to_string()),
++            cursor_home: Some(cursor_home.to_string_lossy().to_string()),
++            mode: Some("ask".to_string()),
++            model: Some("auto".to_string()),
++            timeout_seconds: Some(5),
++            output_max_bytes: Some(64),
++        },
++        root.path(),
++    )?;
++
++    assert_eq!("cursor-agent", prepared.program);
++    assert_eq!(
++        vec![
++            "--extra",
++            "-p",
++            "--trust",
++            "--mode",
++            "ask",
++            "--model",
++            "auto",
++            "--output-format",
++            "text",
++            "inspect the code",
++        ],
++        prepared.args
++    );
++    assert_eq!(cwd, prepared.cwd);
++    assert_eq!(Duration::from_secs(5), prepared.timeout);
++    assert_eq!(64, prepared.output_max_bytes);
++    assert_eq!(
++        Some(&cursor_home.as_os_str().to_os_string()),
++        prepared.env.get(&OsString::from("HOME"))
++    );
++    assert_eq!(
++        Some(&cursor_home.join(".config").into_os_string()),
++        prepared.env.get(&OsString::from("XDG_CONFIG_HOME"))
++    );
++    assert_eq!(
++        Some(&cursor_home.join(".cache").into_os_string()),
++        prepared.env.get(&OsString::from("XDG_CACHE_HOME"))
++    );
++    assert_eq!(
++        Some(&cursor_home.join(".npm").into_os_string()),
++        prepared.env.get(&OsString::from("NPM_CONFIG_CACHE"))
++    );
++    assert!(!prepared.env.contains_key(&OsString::from("CURSOR_API_KEY")));
++    assert!(!prepared.env.contains_key(&OsString::from("APP_SECRET_KEY")));
++
++    Ok(())
++}
++
++#[test]
++fn prepare_cursor_session_command_defaults_to_configured_workspace() -> anyhow::Result<()> {
++    let root = TempDir::new()?;
++    let cursor_home = root.path().join("cursor-home");
++    let auth_dir = cursor_home.join(".config").join("cursor");
++    std::fs::create_dir_all(&auth_dir)?;
++    std::fs::write(auth_dir.join("auth.json"), "{}")?;
++    let default_cwd = root.path().join("configured-workspace");
++    std::fs::create_dir(&default_cwd)?;
++
++    let prepared = prepare_cursor_session_command(
++        CursorSessionToolCallParam {
++            prompt: "inspect the code".to_string(),
++            cwd: None,
++            command: Some("cursor-agent".to_string()),
++            cursor_home: Some(cursor_home.to_string_lossy().to_string()),
++            mode: None,
++            model: None,
++            timeout_seconds: None,
++            output_max_bytes: None,
++        },
++        &default_cwd,
++    )?;
++
++    assert_eq!(default_cwd, prepared.cwd);
++
++    Ok(())
++}
++
++#[test]
++fn prepare_cursor_session_command_requires_mounted_auth_file() {
++    let root = TempDir::new().expect("tempdir");
++
++    let err = prepare_cursor_session_command(
++        CursorSessionToolCallParam {
++            prompt: "inspect the code".to_string(),
++            cwd: None,
++            command: Some("cursor-agent".to_string()),
++            cursor_home: Some(root.path().to_string_lossy().to_string()),
++            mode: None,
++            model: None,
++            timeout_seconds: None,
++            output_max_bytes: None,
++        },
++        root.path(),
++    )
++    .expect_err("missing auth profile should fail");
++
++    assert!(
++        err.to_string()
++            .contains("cursor-session auth file is not available"),
++        "unexpected error: {err}"
++    );
++}
++
++#[test]
++fn prepare_cursor_session_command_caps_output_limit() -> anyhow::Result<()> {
++    let root = TempDir::new()?;
++    let cursor_home = root.path().join("cursor-home");
++    let auth_dir = cursor_home.join(".config").join("cursor");
++    std::fs::create_dir_all(&auth_dir)?;
++    std::fs::write(auth_dir.join("auth.json"), "{}")?;
++
++    let prepared = prepare_cursor_session_command(
++        CursorSessionToolCallParam {
++            prompt: "inspect the code".to_string(),
++            cwd: None,
++            command: Some("cursor-agent".to_string()),
++            cursor_home: Some(cursor_home.to_string_lossy().to_string()),
++            mode: None,
++            model: None,
++            timeout_seconds: None,
++            output_max_bytes: Some(MAX_OUTPUT_MAX_BYTES + 1),
++        },
++        root.path(),
++    )?;
++
++    assert_eq!(MAX_OUTPUT_MAX_BYTES, prepared.output_max_bytes);
++
++    Ok(())
++}
++
++#[test]
++fn read_limited_caps_retained_output_and_drains_reader() -> anyhow::Result<()> {
++    let output = read_limited(Cursor::new(b"abcdef"), 3)?;
++
++    assert_eq!(
++        LimitedOutput {
++            bytes: b"abc".to_vec(),
++            truncated: true,
++        },
++        output
++    );
++
++    Ok(())
++}
++
++#[test]
++fn process_output_preserves_structured_metadata() {
++    let result = CursorSessionProcessOutput {
++        stdout: LimitedOutput {
++            bytes: b"cursor answer".to_vec(),
++            truncated: false,
++        },
++        stderr: LimitedOutput {
++            bytes: Vec::new(),
++            truncated: false,
++        },
++        exit_code: Some(0),
++        timed_out: false,
++    }
++    .into_call_tool_result();
++
++    assert_eq!(Some(false), result.is_error);
++    assert_eq!(
++        Some(serde_json::json!({
++            "content": "cursor answer",
++            "stderr": "",
++            "exitCode": 0,
++            "timedOut": false,
++            "stdoutTruncated": false,
++            "stderrTruncated": false,
++        })),
++        result.structured_content
++    );
++}
+diff --git a/codex-rs/mcp-server/src/lib.rs b/codex-rs/mcp-server/src/lib.rs
+index 4a4ff054..fb90623a 100644
+--- a/codex-rs/mcp-server/src/lib.rs
++++ b/codex-rs/mcp-server/src/lib.rs
+@@ -30,6 +30,7 @@ use tracing_subscriber::prelude::*;
+ 
+ mod codex_tool_config;
+ mod codex_tool_runner;
++mod cursor_session;
+ mod exec_approval;
+ pub(crate) mod message_processor;
+ mod outgoing_message;
+@@ -42,6 +43,7 @@ use crate::outgoing_message::OutgoingMessageSender;
+ 
+ pub use crate::codex_tool_config::CodexToolCallParam;
+ pub use crate::codex_tool_config::CodexToolCallReplyParam;
++pub use crate::cursor_session::CursorSessionToolCallParam;
+ pub use crate::exec_approval::ExecApprovalElicitRequestParams;
+ pub use crate::exec_approval::ExecApprovalResponse;
+ pub use crate::patch_approval::PatchApprovalElicitRequestParams;
+diff --git a/codex-rs/mcp-server/src/message_processor.rs b/codex-rs/mcp-server/src/message_processor.rs
+index d211ff0a..2ccf211a 100644
+--- a/codex-rs/mcp-server/src/message_processor.rs
++++ b/codex-rs/mcp-server/src/message_processor.rs
+@@ -1,4 +1,5 @@
+ use std::collections::HashMap;
++use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+ use codex_arg0::Arg0DispatchPaths;
+@@ -36,12 +37,15 @@ use crate::codex_tool_config::CodexToolCallParam;
+ use crate::codex_tool_config::CodexToolCallReplyParam;
+ use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
+ use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
++use crate::cursor_session::create_tool_for_cursor_session_tool_call_param;
++use crate::cursor_session::handle_cursor_session_tool_call;
+ use crate::outgoing_message::OutgoingMessageSender;
+ 
+ pub(crate) struct MessageProcessor {
+     outgoing: Arc<OutgoingMessageSender>,
+     initialized: bool,
+     arg0_paths: Arg0DispatchPaths,
++    cursor_session_cwd: PathBuf,
+     thread_manager: Arc<ThreadManager>,
+     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+ }
+@@ -66,6 +70,7 @@ impl MessageProcessor {
+         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
+             config.codex_home.clone(),
+         ));
++        let cursor_session_cwd = config.cwd.to_path_buf();
+         let thread_manager = Arc::new(ThreadManager::new(
+             config.as_ref(),
+             auth_manager,
+@@ -84,6 +89,7 @@ impl MessageProcessor {
+             outgoing,
+             initialized: false,
+             arg0_paths,
++            cursor_session_cwd,
+             thread_manager,
+             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+         }
+@@ -321,6 +327,7 @@ impl MessageProcessor {
+             tools: vec![
+                 create_tool_for_codex_tool_call_param(),
+                 create_tool_for_codex_tool_call_reply_param(),
++                create_tool_for_cursor_session_tool_call_param(),
+             ],
+             next_cursor: None,
+         };
+@@ -340,6 +347,12 @@ impl MessageProcessor {
+                 self.handle_tool_call_codex_session_reply(id, arguments)
+                     .await
+             }
++            "cursor-session" => {
++                let result =
++                    handle_cursor_session_tool_call(arguments, self.cursor_session_cwd.clone())
++                        .await;
++                self.outgoing.send_response(id, result).await;
++            }
+             _ => {
+                 let result = CallToolResult::error(vec![rmcp::model::Content::text(format!(
+                     "Unknown tool '{name}'"
+diff --git a/codex-rs/mcp-server/tests/common/mcp_process.rs b/codex-rs/mcp-server/tests/common/mcp_process.rs
+index 007d2c11..708ec8eb 100644
+--- a/codex-rs/mcp-server/tests/common/mcp_process.rs
++++ b/codex-rs/mcp-server/tests/common/mcp_process.rs
+@@ -22,6 +22,7 @@ use rmcp::model::ElicitationCapability;
+ use rmcp::model::FormElicitationCapability;
+ use rmcp::model::Implementation;
+ use rmcp::model::InitializeRequestParams;
++use rmcp::model::JsonObject;
+ use rmcp::model::JsonRpcMessage;
+ use rmcp::model::JsonRpcNotification;
+ use rmcp::model::JsonRpcRequest;
+@@ -56,6 +57,18 @@ impl McpProcess {
+     pub async fn new_with_env(
+         codex_home: &Path,
+         env_overrides: &[(&str, Option<&str>)],
++    ) -> anyhow::Result<Self> {
++        Self::new_with_env_and_cwd(codex_home, env_overrides, /*cwd*/ None).await
++    }
++
++    pub async fn new_with_cwd(codex_home: &Path, cwd: &Path) -> anyhow::Result<Self> {
++        Self::new_with_env_and_cwd(codex_home, /*env_overrides*/ &[], Some(cwd)).await
++    }
++
++    async fn new_with_env_and_cwd(
++        codex_home: &Path,
++        env_overrides: &[(&str, Option<&str>)],
++        cwd: Option<&Path>,
+     ) -> anyhow::Result<Self> {
+         let program = codex_utils_cargo_bin::cargo_bin("codex-mcp-server")
+             .context("should find binary for codex-mcp-server")?;
+@@ -66,6 +79,9 @@ impl McpProcess {
+         cmd.stderr(Stdio::piped());
+         cmd.env("CODEX_HOME", codex_home);
+         cmd.env("RUST_LOG", "debug");
++        if let Some(cwd) = cwd {
++            cmd.current_dir(cwd);
++        }
+ 
+         for (k, v) in env_overrides {
+             match v {
+@@ -190,17 +206,28 @@ impl McpProcess {
+         &mut self,
+         params: CodexToolCallParam,
+     ) -> anyhow::Result<i64> {
+-        let codex_tool_call_params = CallToolRequestParams::new("codex").with_arguments(
+-            match serde_json::to_value(params)? {
+-                serde_json::Value::Object(map) => map,
+-                _ => unreachable!("params serialize to object"),
+-            },
+-        );
+-        self.send_request(
+-            "tools/call",
+-            Some(serde_json::to_value(codex_tool_call_params)?),
+-        )
+-        .await
++        let arguments = match serde_json::to_value(params)? {
++            serde_json::Value::Object(map) => map,
++            _ => unreachable!("params serialize to object"),
++        };
++        self.send_tool_call("codex", Some(arguments)).await
++    }
++
++    pub async fn send_tool_call(
++        &mut self,
++        tool_name: &str,
++        arguments: Option<JsonObject>,
++    ) -> anyhow::Result<i64> {
++        let mut params = CallToolRequestParams::new(tool_name.to_string());
++        if let Some(arguments) = arguments {
++            params = params.with_arguments(arguments);
++        }
++        self.send_request("tools/call", Some(serde_json::to_value(params)?))
++            .await
++    }
++
++    pub async fn send_list_tools(&mut self) -> anyhow::Result<i64> {
++        self.send_request("tools/list", None).await
+     }
+ 
+     async fn send_request(
+diff --git a/codex-rs/mcp-server/tests/suite/cursor_session_tool.rs b/codex-rs/mcp-server/tests/suite/cursor_session_tool.rs
+new file mode 100644
+index 00000000..354406a6
+--- /dev/null
++++ b/codex-rs/mcp-server/tests/suite/cursor_session_tool.rs
+@@ -0,0 +1,176 @@
++use std::time::Duration;
++
++use pretty_assertions::assert_eq;
++use rmcp::model::JsonObject;
++use rmcp::model::RequestId;
++use serde_json::json;
++use tempfile::TempDir;
++use tokio::time::timeout;
++
++use mcp_test_support::McpProcess;
++
++const READ_TIMEOUT: Duration = Duration::from_secs(20);
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn list_tools_exposes_cursor_session_tool() -> anyhow::Result<()> {
++    let codex_home = TempDir::new()?;
++    let mut process = McpProcess::new(codex_home.path()).await?;
++    process.initialize().await?;
++
++    let request_id = process.send_list_tools().await?;
++    let response = timeout(
++        READ_TIMEOUT,
++        process.read_stream_until_response_message(RequestId::Number(request_id)),
++    )
++    .await??;
++
++    let tools = response
++        .result
++        .get("tools")
++        .and_then(serde_json::Value::as_array)
++        .expect("tools/list response should contain tools");
++    let cursor_session = tools
++        .iter()
++        .find(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some("cursor-session"))
++        .expect("cursor-session tool should be listed");
++
++    assert_eq!(Some(&json!("Cursor Session")), cursor_session.get("title"));
++    assert_eq!(
++        Some(&json!(["prompt"])),
++        cursor_session.pointer("/inputSchema/required")
++    );
++    assert_eq!(
++        Some(&json!("object")),
++        cursor_session.pointer("/outputSchema/type")
++    );
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn cursor_session_tool_call_routes_to_handler() -> anyhow::Result<()> {
++    let codex_home = TempDir::new()?;
++    let mut process = McpProcess::new(codex_home.path()).await?;
++    process.initialize().await?;
++
++    let request_id = process.send_tool_call("cursor-session", None).await?;
++    let response = timeout(
++        READ_TIMEOUT,
++        process.read_stream_until_response_message(RequestId::Number(request_id)),
++    )
++    .await??;
++
++    assert_eq!(
++        Some(true),
++        response
++            .result
++            .get("isError")
++            .and_then(serde_json::Value::as_bool)
++    );
++    assert_eq!(
++        Some("Missing arguments for cursor-session tool-call; the `prompt` field is required."),
++        response
++            .result
++            .pointer("/content/0/text")
++            .and_then(serde_json::Value::as_str)
++    );
++
++    Ok(())
++}
++
++#[cfg(unix)]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn cursor_session_tool_call_uses_configured_workspace_by_default() -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++
++    let temp_dir = TempDir::new()?;
++    let codex_home = temp_dir.path().join("codex-home");
++    let cursor_home = temp_dir.path().join("cursor-home");
++    let auth_dir = cursor_home.join(".config").join("cursor");
++    let workspace = temp_dir.path().join("workspace");
++    std::fs::create_dir(&codex_home)?;
++    std::fs::create_dir_all(&auth_dir)?;
++    std::fs::create_dir(&workspace)?;
++    std::fs::write(auth_dir.join("auth.json"), "{}")?;
++    std::fs::write(workspace.join("target.txt"), "workspace evidence")?;
++
++    let fake_agent = temp_dir.path().join("fake-cursor-agent");
++    std::fs::write(
++        &fake_agent,
++        r#"#!/bin/sh
++set -eu
++last=
++for arg in "$@"; do
++  last=$arg
++done
++printf 'cwd=%s\n' "$PWD"
++printf 'file=%s\n' "$(cat target.txt)"
++printf 'prompt=%s\n' "$last"
++"#,
++    )?;
++    let mut permissions = std::fs::metadata(&fake_agent)?.permissions();
++    permissions.set_mode(0o700);
++    std::fs::set_permissions(&fake_agent, permissions)?;
++
++    let mut process = McpProcess::new_with_cwd(&codex_home, &workspace).await?;
++    process.initialize().await?;
++
++    let arguments = JsonObject::from_iter([
++        (
++            "prompt".to_string(),
++            json!("inspect target.txt and report what it contains"),
++        ),
++        (
++            "command".to_string(),
++            json!(fake_agent.to_string_lossy().to_string()),
++        ),
++        (
++            "cursor-home".to_string(),
++            json!(cursor_home.to_string_lossy().to_string()),
++        ),
++    ]);
++    let request_id = process
++        .send_tool_call("cursor-session", Some(arguments))
++        .await?;
++    let response = timeout(
++        READ_TIMEOUT,
++        process.read_stream_until_response_message(RequestId::Number(request_id)),
++    )
++    .await??;
++
++    assert_eq!(
++        Some(false),
++        response
++            .result
++            .get("isError")
++            .and_then(serde_json::Value::as_bool)
++    );
++    assert_eq!(
++        Some(&json!(false)),
++        response.result.pointer("/structuredContent/timedOut")
++    );
++    assert_eq!(
++        Some(&json!(0)),
++        response.result.pointer("/structuredContent/exitCode")
++    );
++
++    let content = response
++        .result
++        .pointer("/structuredContent/content")
++        .and_then(serde_json::Value::as_str)
++        .expect("structured content should include stdout");
++    assert!(
++        content.contains(&format!("cwd={}", workspace.display())),
++        "unexpected content: {content}"
++    );
++    assert!(
++        content.contains("workspace evidence"),
++        "unexpected content: {content}"
++    );
++    assert!(
++        content.contains("inspect target.txt"),
++        "unexpected content: {content}"
++    );
++
++    Ok(())
++}
+diff --git a/codex-rs/mcp-server/tests/suite/mod.rs b/codex-rs/mcp-server/tests/suite/mod.rs
+index 6b50853b..9f991d8c 100644
+--- a/codex-rs/mcp-server/tests/suite/mod.rs
++++ b/codex-rs/mcp-server/tests/suite/mod.rs
+@@ -1 +1,2 @@
+ mod codex_tool;
++mod cursor_session_tool;
+-- 
+2.51.0
+

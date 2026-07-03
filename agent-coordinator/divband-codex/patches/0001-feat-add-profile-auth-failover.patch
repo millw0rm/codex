@@ -1,0 +1,3146 @@
+From 775880c92541ca4d992a5e1273dc36df64ef36ee Mon Sep 17 00:00:00 2001
+From: your name <you@exampl.ecom>
+Date: Thu, 2 Jul 2026 21:45:37 +0330
+Subject: [PATCH 1/7] feat: add profile auth failover
+
+---
+ codex-rs/Cargo.lock                           |   1 +
+ codex-rs/cli/Cargo.toml                       |   5 +
+ codex-rs/cli/src/bin/codex-profiles.rs        |   5 +
+ codex-rs/cli/src/lib.rs                       |   1 +
+ codex-rs/cli/src/main.rs                      |  57 +++
+ codex-rs/cli/src/profile_manager_cmd.rs       | 359 +++++++++++++
+ codex-rs/cli/src/profile_manager_cmd/auth.rs  | 130 +++++
+ .../cli/src/profile_manager_cmd/fs_utils.rs   |  91 ++++
+ .../cli/src/profile_manager_cmd/limits.rs     | 348 +++++++++++++
+ .../cli/src/profile_manager_cmd/project.rs    | 104 ++++
+ codex-rs/cli/src/profile_manager_cmd/root.rs  | 387 ++++++++++++++
+ codex-rs/cli/src/profile_manager_cmd_tests.rs | 251 ++++++++++
+ codex-rs/cli/src/profile_pool_cmd.rs          | 472 ++++++++++++++++++
+ codex-rs/cli/src/profile_pool_cmd_tests.rs    | 132 +++++
+ codex-rs/core/src/config/mod.rs               |  18 +
+ codex-rs/core/src/session/mod.rs              |   1 +
+ .../core/src/session/profile_auth_failover.rs | 110 ++++
+ .../session/profile_auth_failover_tests.rs    |  85 ++++
+ codex-rs/core/src/session/session.rs          |  13 +
+ codex-rs/core/src/session/tests.rs            |   2 +
+ codex-rs/core/src/session/turn.rs             |  32 ++
+ codex-rs/core/src/state/service.rs            |   2 +
+ codex-rs/exec/src/lib.rs                      |   1 +
+ codex-rs/tui/src/cli.rs                       |  15 +
+ codex-rs/tui/src/ide_context/ipc.rs           |   3 +
+ codex-rs/tui/src/lib.rs                       |  40 +-
+ 26 files changed, 2654 insertions(+), 11 deletions(-)
+ create mode 100644 codex-rs/cli/src/bin/codex-profiles.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd/auth.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd/fs_utils.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd/limits.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd/project.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd/root.rs
+ create mode 100644 codex-rs/cli/src/profile_manager_cmd_tests.rs
+ create mode 100644 codex-rs/cli/src/profile_pool_cmd.rs
+ create mode 100644 codex-rs/cli/src/profile_pool_cmd_tests.rs
+ create mode 100644 codex-rs/core/src/session/profile_auth_failover.rs
+ create mode 100644 codex-rs/core/src/session/profile_auth_failover_tests.rs
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 3561550d..12ed503f 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2370,6 +2370,7 @@ dependencies = [
+  "predicates",
+  "pretty_assertions",
+  "regex-lite",
++ "reqwest 0.12.28",
+  "serde",
+  "serde_json",
+  "sqlx",
+diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
+index 9a8312ce..8498a74e 100644
+--- a/codex-rs/cli/Cargo.toml
++++ b/codex-rs/cli/Cargo.toml
+@@ -9,6 +9,10 @@ build = "build.rs"
+ name = "codex"
+ path = "src/main.rs"
+ 
++[[bin]]
++name = "codex-profiles"
++path = "src/bin/codex-profiles.rs"
++
+ [lib]
+ name = "codex_cli"
+ path = "src/lib.rs"
+@@ -65,6 +69,7 @@ libc = { workspace = true }
+ os_info = { workspace = true }
+ owo-colors = { workspace = true }
+ regex-lite = { workspace = true }
++reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ supports-color = { workspace = true }
+diff --git a/codex-rs/cli/src/bin/codex-profiles.rs b/codex-rs/cli/src/bin/codex-profiles.rs
+new file mode 100644
+index 00000000..6afad75e
+--- /dev/null
++++ b/codex-rs/cli/src/bin/codex-profiles.rs
+@@ -0,0 +1,5 @@
++use codex_cli::profile_manager_cmd::ProfilesCli;
++
++fn main() -> anyhow::Result<()> {
++    ProfilesCli::run_from_args()
++}
+diff --git a/codex-rs/cli/src/lib.rs b/codex-rs/cli/src/lib.rs
+index c008567b..de12dfc1 100644
+--- a/codex-rs/cli/src/lib.rs
++++ b/codex-rs/cli/src/lib.rs
+@@ -1,6 +1,7 @@
+ pub(crate) mod debug_sandbox;
+ mod exit_status;
+ pub(crate) mod login;
++pub mod profile_manager_cmd;
+ 
+ use clap::Args;
+ use clap::Parser;
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index c766baa0..84542866 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -31,6 +31,7 @@ use codex_state::memories_db_path;
+ use codex_tui::AppExitInfo;
+ use codex_tui::Cli as TuiCli;
+ use codex_tui::ExitReason;
++use codex_tui::ProfileAuthLaunch;
+ use codex_tui::UpdateAction;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_cli::CliConfigOverrides;
+@@ -53,6 +54,7 @@ mod exec_server_telemetry;
+ mod marketplace_cmd;
+ mod mcp_cmd;
+ mod plugin_cmd;
++mod profile_pool_cmd;
+ mod remote_control_cmd;
+ #[cfg(target_os = "windows")]
+ mod sandbox_setup;
+@@ -63,6 +65,7 @@ mod wsl_paths;
+ use crate::mcp_cmd::McpCli;
+ use crate::plugin_cmd::PluginCli;
+ use crate::plugin_cmd::PluginSubcommand;
++use crate::profile_pool_cmd::ProfilePoolCli;
+ use crate::remote_control_cmd::RemoteControlCommand;
+ use doctor::DoctorCommand;
+ use state_db_recovery as local_state_db;
+@@ -141,6 +144,9 @@ enum Subcommand {
+     /// Manage Codex plugins.
+     Plugin(PluginCli),
+ 
++    /// [experimental] Manage a portable pool of Codex account profiles.
++    Pool(ProfilePoolCli),
++
+     /// Start Codex as an MCP server (stdio).
+     McpServer(McpServerCommand),
+ 
+@@ -986,6 +992,14 @@ async fn cli_main(
+ 
+     match subcommand {
+         None => {
++            if interactive.best_profile {
++                reject_remote_mode_for_subcommand(
++                    root_remote.as_deref(),
++                    root_remote_auth_token_env.as_deref(),
++                    "--best",
++                )?;
++                configure_best_profile_launch(&mut interactive).await?;
++            }
+             prepend_config_flags(
+                 &mut interactive.config_overrides,
+                 root_config_overrides.clone(),
+@@ -1097,6 +1111,17 @@ async fn cli_main(
+                 }
+             }
+         }
++        Some(Subcommand::Pool(pool_cli)) => {
++            reject_remote_mode_for_subcommand(
++                root_remote.as_deref(),
++                root_remote_auth_token_env.as_deref(),
++                "pool",
++            )?;
++            let cli_overrides = root_config_overrides
++                .parse_overrides()
++                .map_err(anyhow::Error::msg)?;
++            profile_pool_cmd::run(pool_cli, cli_overrides).await?;
++        }
+         Some(Subcommand::AppServer(app_server_cli)) => {
+             let AppServerCommand {
+                 subcommand,
+@@ -1820,6 +1845,30 @@ async fn load_exec_server_config(
+         .await?)
+ }
+ 
++async fn configure_best_profile_launch(interactive: &mut TuiCli) -> anyhow::Result<()> {
++    eprintln!("Refreshing profile usage limits...");
++    let project_dir = interactive.cwd.clone();
++    let launch = tokio::task::spawn_blocking(move || {
++        codex_cli::profile_manager_cmd::prepare_best_profile_launch(
++            /*root_dir*/ None,
++            project_dir.as_deref(),
++            /*refresh_limits*/ true,
++        )
++    })
++    .await??;
++    eprintln!(
++        "Using project {} with profile {}; CODEX_HOME={}",
++        launch.project_id,
++        launch.active_profile,
++        launch.codex_home.display()
++    );
++    interactive.profile_auth_launch = Some(ProfileAuthLaunch {
++        codex_home: launch.codex_home,
++        failover: launch.failover,
++    });
++    Ok(())
++}
++
+ async fn load_exec_server_remote_auth(
+     config: &codex_core::config::Config,
+     missing_auth_error: &'static str,
+@@ -2121,6 +2170,7 @@ fn unsupported_subcommand_name_for_strict_config(
+         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
+         Some(Subcommand::Mcp(_)) => Some("mcp"),
+         Some(Subcommand::Plugin(_)) => Some("plugin"),
++        Some(Subcommand::Pool(_)) => Some("pool"),
+         #[cfg(any(target_os = "macos", target_os = "windows"))]
+         Some(Subcommand::App(_)) => Some("app"),
+         Some(Subcommand::Login(_)) => Some("login"),
+@@ -2918,6 +2968,13 @@ mod tests {
+         assert!(matches!(cli.subcommand, Some(Subcommand::Update)));
+     }
+ 
++    #[test]
++    fn best_profile_parses_on_interactive_root() {
++        let cli = MultitoolCli::try_parse_from(["codex", "--best"]).expect("parse");
++        assert!(cli.interactive.best_profile);
++        assert!(cli.subcommand.is_none());
++    }
++
+     #[test]
+     fn archive_merges_scoped_tui_flags() {
+         let (target, interactive, remote) = finalize_archive_from_args(
+diff --git a/codex-rs/cli/src/profile_manager_cmd.rs b/codex-rs/cli/src/profile_manager_cmd.rs
+new file mode 100644
+index 00000000..6dd696ae
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd.rs
+@@ -0,0 +1,359 @@
++#[path = "profile_manager_cmd/auth.rs"]
++mod auth;
++#[path = "profile_manager_cmd/fs_utils.rs"]
++mod fs_utils;
++#[path = "profile_manager_cmd/limits.rs"]
++mod limits;
++#[path = "profile_manager_cmd/project.rs"]
++mod project;
++#[path = "profile_manager_cmd/root.rs"]
++mod root;
++
++use auth::require_auth;
++use clap::Args;
++use clap::Parser;
++use codex_core::config::ProfileAuthCandidateConfig;
++use codex_core::config::ProfileAuthFailoverConfig;
++use limits::best_profile;
++use limits::limit_reports;
++use limits::percent_text;
++use limits::print_limits;
++use limits::ranked_profiles;
++use limits::status_name;
++use project::resolve_project;
++use root::ProfilesRoot;
++use root::resolve_codex_bin;
++use root::resolve_root;
++use root::run_codex;
++use root::run_codex_login;
++use root::shell_quote;
++use std::ffi::OsString;
++use std::path::Path;
++use std::path::PathBuf;
++
++#[cfg(test)]
++use limits::LimitStatus;
++#[cfg(test)]
++use limits::classify_limit_status;
++#[cfg(test)]
++use project::project_id_for_root;
++#[cfg(test)]
++use root::default_root;
++#[cfg(test)]
++use std::fs;
++
++#[cfg(test)]
++#[path = "profile_manager_cmd_tests.rs"]
++mod tests;
++
++/// Manage self-contained Codex profiles and project homes.
++#[derive(Debug, Parser)]
++#[command(
++    name = "codex-profiles",
++    version,
++    about = "Manage self-contained Codex profile homes"
++)]
++pub struct ProfilesCli {
++    /// Root directory for all managed profile state.
++    #[arg(long, env = "CODEX_PROFILES_DIR", value_name = "DIR")]
++    root: Option<PathBuf>,
++
++    /// Codex executable to launch for login/run commands.
++    #[arg(
++        long = "codex-bin",
++        env = "CODEX_PROFILES_CODEX_BIN",
++        value_name = "BIN"
++    )]
++    codex_bin: Option<PathBuf>,
++
++    #[command(subcommand)]
++    command: ProfilesCommand,
++}
++
++#[derive(Debug, clap::Subcommand)]
++enum ProfilesCommand {
++    /// Create the profile root directories.
++    Init,
++
++    /// Create a profile home, optionally running `codex login`.
++    Add(AddArgs),
++
++    /// Import auth.json from a file or another CODEX_HOME.
++    Import(ImportArgs),
++
++    /// Run `codex login` in a managed profile home.
++    Login(LoginArgs),
++
++    /// Select the default profile.
++    Use(ProfileNameArg),
++
++    /// Print the selected profile.
++    Current,
++
++    /// List managed profiles.
++    List,
++
++    /// Remove a profile home and cached limits.
++    Remove(ProfileNameArg),
++
++    /// Print a profile CODEX_HOME.
++    Path(OptionalProfileNameArg),
++
++    /// Print shell exports for a profile CODEX_HOME.
++    Env(OptionalProfileNameArg),
++
++    /// Print the stable project CODEX_HOME for a directory.
++    Project(ProjectArgs),
++
++    /// Run Codex with a managed CODEX_HOME.
++    Run(RunArgs),
++
++    /// Show cached or refreshed usage limits.
++    Limits(LimitsArgs),
++
++    /// Print the best currently usable profile.
++    Best(ProfilesFilterArgs),
++}
++
++#[derive(Debug, Args)]
++struct AddArgs {
++    name: String,
++
++    /// Only create the home; do not start login.
++    #[arg(long = "no-login", default_value_t = false)]
++    no_login: bool,
++}
++
++#[derive(Debug, Args)]
++struct ImportArgs {
++    name: String,
++    auth_file_or_codex_home: PathBuf,
++}
++
++#[derive(Debug, Args)]
++struct LoginArgs {
++    name: Option<String>,
++
++    /// Arguments passed after `--` are forwarded to `codex login`.
++    #[arg(last = true)]
++    login_args: Vec<OsString>,
++}
++
++#[derive(Debug, Args)]
++struct ProfileNameArg {
++    name: String,
++}
++
++#[derive(Debug, Args)]
++struct OptionalProfileNameArg {
++    name: Option<String>,
++}
++
++#[derive(Debug, Args)]
++struct ProjectArgs {
++    directory: Option<PathBuf>,
++}
++
++#[derive(Debug, Args)]
++struct RunArgs {
++    /// Select the best usable profile from cached/refreshed limits.
++    #[arg(long, default_value_t = false)]
++    best: bool,
++
++    /// Refresh ChatGPT usage before selecting with --best.
++    #[arg(long = "refresh-limits", default_value_t = false)]
++    refresh_limits: bool,
++
++    /// Use a stable per-project CODEX_HOME while copying selected auth into it.
++    #[arg(long, default_value_t = false)]
++    project: bool,
++
++    /// Override the generated project id.
++    #[arg(long = "project-id", value_name = "ID")]
++    project_id: Option<String>,
++
++    /// Directory used for project id/root resolution.
++    #[arg(long = "project-dir", value_name = "DIR")]
++    project_dir: Option<PathBuf>,
++
++    /// Profile name. Omit with --best to auto-select.
++    name: Option<String>,
++
++    /// Arguments passed after `--` are forwarded to Codex.
++    #[arg(last = true)]
++    codex_args: Vec<OsString>,
++}
++
++#[derive(Debug, Args)]
++struct LimitsArgs {
++    /// Refresh ChatGPT usage from the backend even when a cache exists.
++    #[arg(long, default_value_t = false)]
++    refresh: bool,
++
++    names: Vec<String>,
++}
++
++#[derive(Debug, Args)]
++struct ProfilesFilterArgs {
++    /// Refresh ChatGPT usage from the backend even when a cache exists.
++    #[arg(long, default_value_t = false)]
++    refresh: bool,
++
++    names: Vec<String>,
++}
++
++#[derive(Debug, Clone)]
++pub struct BestProfileLaunch {
++    pub codex_home: PathBuf,
++    pub active_profile: String,
++    pub project_id: String,
++    pub failover: ProfileAuthFailoverConfig,
++}
++
++pub fn prepare_best_profile_launch(
++    root_dir: Option<PathBuf>,
++    project_dir: Option<&Path>,
++    refresh_limits: bool,
++) -> anyhow::Result<BestProfileLaunch> {
++    let root = ProfilesRoot::new(resolve_root(root_dir)?);
++    let ranked = ranked_profiles(&root, &[], refresh_limits)?;
++    let Some(active) = ranked.first() else {
++        anyhow::bail!("no usable profile found");
++    };
++    let active_profile = active.name.clone();
++
++    let (project_id, project_root) = resolve_project(project_dir, None)?;
++    let codex_home = root.ensure_project_home(&project_id, &project_root, &active_profile)?;
++    let candidates = ranked
++        .into_iter()
++        .map(|profile| ProfileAuthCandidateConfig {
++            auth_file: root.profile_home(&profile.name).join("auth.json"),
++            name: profile.name,
++        })
++        .collect();
++
++    Ok(BestProfileLaunch {
++        codex_home,
++        active_profile: active_profile.clone(),
++        project_id,
++        failover: ProfileAuthFailoverConfig {
++            active_profile,
++            candidates,
++        },
++    })
++}
++
++impl ProfilesCli {
++    pub fn run_from_args() -> anyhow::Result<()> {
++        Self::parse().run()
++    }
++
++    fn run(self) -> anyhow::Result<()> {
++        let root = ProfilesRoot::new(resolve_root(self.root)?);
++        let codex_bin = resolve_codex_bin(self.codex_bin);
++        match self.command {
++            ProfilesCommand::Init => {
++                root.ensure_dirs()?;
++                println!("{}", root.root.display());
++            }
++            ProfilesCommand::Add(args) => {
++                root.ensure_profile_home(&args.name)?;
++                if args.no_login {
++                    root.set_current(&args.name)?;
++                    println!("created {}", root.profile_home(&args.name).display());
++                } else {
++                    run_codex_login(&codex_bin, &root.profile_home(&args.name), &[])?;
++                    require_auth(&root.profile_home(&args.name))?;
++                    root.set_current(&args.name)?;
++                    println!("added {}", args.name);
++                }
++            }
++            ProfilesCommand::Import(args) => {
++                root.import_profile(&args.name, &args.auth_file_or_codex_home)?;
++                println!("imported {}", args.name);
++            }
++            ProfilesCommand::Login(args) => {
++                let name = root.resolve_name(args.name.as_deref())?;
++                root.ensure_profile_home(&name)?;
++                run_codex_login(&codex_bin, &root.profile_home(&name), &args.login_args)?;
++                require_auth(&root.profile_home(&name))?;
++                root.set_current(&name)?;
++                println!("logged in {name}");
++            }
++            ProfilesCommand::Use(args) => {
++                root.require_profile(&args.name)?;
++                root.set_current(&args.name)?;
++                println!("selected {}", args.name);
++            }
++            ProfilesCommand::Current => {
++                let name = root.current_name()?;
++                println!("{}\t{}", name, root.profile_home(&name).display());
++            }
++            ProfilesCommand::List => root.print_profiles()?,
++            ProfilesCommand::Remove(args) => {
++                root.remove_profile(&args.name)?;
++                println!("removed {}", args.name);
++            }
++            ProfilesCommand::Path(args) => {
++                let name = root.resolve_name(args.name.as_deref())?;
++                root.require_profile(&name)?;
++                println!("{}", root.profile_home(&name).display());
++            }
++            ProfilesCommand::Env(args) => {
++                let name = root.resolve_name(args.name.as_deref())?;
++                root.require_profile(&name)?;
++                println!(
++                    "export CODEX_HOME={}",
++                    shell_quote(&root.profile_home(&name))
++                );
++            }
++            ProfilesCommand::Project(args) => {
++                let (id, project_root) = resolve_project(args.directory.as_deref(), None)?;
++                let home = root.project_home(&id);
++                println!("id\t{id}");
++                println!("root\t{}", project_root.display());
++                println!("CODEX_HOME\t{}", home.display());
++            }
++            ProfilesCommand::Run(args) => {
++                let name = if args.best {
++                    best_profile(&root, &[], args.refresh_limits)?.name
++                } else {
++                    root.resolve_name(args.name.as_deref())?
++                };
++                root.require_profile(&name)?;
++
++                let codex_home = if args.project {
++                    let dir = args.project_dir.as_deref();
++                    let (id, project_root) = resolve_project(dir, args.project_id.as_deref())?;
++                    let home = root.ensure_project_home(&id, &project_root, &name)?;
++                    eprintln!(
++                        "Using project {id} with profile {name}; CODEX_HOME={}",
++                        home.display()
++                    );
++                    home
++                } else {
++                    let home = root.profile_home(&name);
++                    eprintln!("Using profile {name}; CODEX_HOME={}", home.display());
++                    home
++                };
++                run_codex(&codex_bin, &codex_home, &args.codex_args)?;
++            }
++            ProfilesCommand::Limits(args) => {
++                let reports = limit_reports(&root, &args.names, args.refresh)?;
++                print_limits(&reports);
++            }
++            ProfilesCommand::Best(args) => {
++                let best = best_profile(&root, &args.names, args.refresh)?;
++                println!(
++                    "best={} status={} 5h={} weekly={} {}",
++                    best.name,
++                    status_name(best.status),
++                    percent_text(best.five_hour_percent),
++                    percent_text(best.weekly_percent),
++                    best.detail
++                );
++            }
++        }
++        Ok(())
++    }
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd/auth.rs b/codex-rs/cli/src/profile_manager_cmd/auth.rs
+new file mode 100644
+index 00000000..8e20a889
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd/auth.rs
+@@ -0,0 +1,130 @@
++use anyhow::Context;
++use codex_login::AuthDotJson;
++use codex_protocol::auth::AuthMode;
++use std::fs;
++use std::path::Path;
++
++#[derive(Debug, Clone)]
++pub(super) struct AuthSummary {
++    pub(super) mode: AuthMode,
++    pub(super) email: Option<String>,
++    pub(super) access_token: Option<String>,
++    pub(super) account_id: Option<String>,
++    pub(super) valid: bool,
++    pub(super) message: String,
++}
++
++pub(super) fn require_auth(codex_home: &Path) -> anyhow::Result<()> {
++    if codex_home.join("auth.json").is_file() {
++        Ok(())
++    } else {
++        anyhow::bail!(
++            "Codex login completed without creating {}",
++            codex_home.join("auth.json").display()
++        )
++    }
++}
++
++pub(super) fn read_auth_summary(codex_home: &Path) -> anyhow::Result<AuthSummary> {
++    let path = codex_home.join("auth.json");
++    let contents =
++        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
++    let auth: AuthDotJson = serde_json::from_str(&contents)
++        .with_context(|| format!("failed to parse {}", path.display()))?;
++    Ok(auth_summary(&auth))
++}
++
++fn auth_summary(auth: &AuthDotJson) -> AuthSummary {
++    let mode = resolved_auth_mode(auth);
++    let mut valid = true;
++    let message = match mode {
++        AuthMode::ApiKey => match auth.openai_api_key.as_deref() {
++            Some(key) if !key.trim().is_empty() => "api_key".to_string(),
++            Some(_) | None => {
++                valid = false;
++                "missing API key".to_string()
++            }
++        },
++        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
++            match auth
++                .tokens
++                .as_ref()
++                .map(|tokens| tokens.access_token.trim())
++            {
++                Some(access_token) if !access_token.is_empty() => "chatgpt".to_string(),
++                Some(_) | None => {
++                    valid = false;
++                    "missing ChatGPT access token".to_string()
++                }
++            }
++        }
++        AuthMode::AgentIdentity => {
++            if auth
++                .agent_identity
++                .as_ref()
++                .is_some_and(codex_login::auth::AgentIdentityStorage::has_auth_material)
++            {
++                "agent_identity".to_string()
++            } else {
++                valid = false;
++                "missing agent identity auth material".to_string()
++            }
++        }
++        AuthMode::PersonalAccessToken => {
++            if auth
++                .personal_access_token
++                .as_deref()
++                .is_some_and(|token| !token.trim().is_empty())
++            {
++                "personal_access_token".to_string()
++            } else {
++                valid = false;
++                "missing personal access token".to_string()
++            }
++        }
++        AuthMode::BedrockApiKey => {
++            if auth.bedrock_api_key.is_some() {
++                "bedrock_api_key".to_string()
++            } else {
++                valid = false;
++                "missing Bedrock API key".to_string()
++            }
++        }
++    };
++
++    AuthSummary {
++        mode,
++        email: auth
++            .tokens
++            .as_ref()
++            .and_then(|tokens| tokens.id_token.email.clone()),
++        access_token: auth
++            .tokens
++            .as_ref()
++            .map(|tokens| tokens.access_token.clone()),
++        account_id: auth.tokens.as_ref().and_then(|tokens| {
++            tokens
++                .account_id
++                .clone()
++                .or_else(|| tokens.id_token.chatgpt_account_id.clone())
++        }),
++        valid,
++        message,
++    }
++}
++
++fn resolved_auth_mode(auth: &AuthDotJson) -> AuthMode {
++    if let Some(mode) = auth.auth_mode {
++        return mode;
++    }
++    if auth.personal_access_token.is_some() {
++        return AuthMode::PersonalAccessToken;
++    }
++    if auth.bedrock_api_key.is_some() {
++        return AuthMode::BedrockApiKey;
++    }
++    if auth.openai_api_key.is_some() {
++        return AuthMode::ApiKey;
++    }
++    AuthMode::Chatgpt
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd/fs_utils.rs b/codex-rs/cli/src/profile_manager_cmd/fs_utils.rs
+new file mode 100644
+index 00000000..b859fca2
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd/fs_utils.rs
+@@ -0,0 +1,91 @@
++use anyhow::Context;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++
++pub(super) fn copy_template_entries(
++    template_home: &Path,
++    destination_home: &Path,
++) -> anyhow::Result<()> {
++    for entry in [
++        "config.toml",
++        "requirements.toml",
++        "skills",
++        "plugins",
++        "rules",
++        "memories",
++    ] {
++        let source = template_home.join(entry);
++        let destination = destination_home.join(entry);
++        if source.exists() && !destination.exists() {
++            copy_recursively(&source, &destination)
++                .with_context(|| format!("failed to copy template entry `{entry}`"))?;
++        }
++    }
++    Ok(())
++}
++
++fn copy_recursively(source: &Path, destination: &Path) -> anyhow::Result<()> {
++    if source.is_dir() {
++        fs::create_dir_all(destination)?;
++        restrict_dir(destination)?;
++        for entry in fs::read_dir(source)? {
++            let entry = entry?;
++            copy_recursively(&entry.path(), &destination.join(entry.file_name()))?;
++        }
++    } else {
++        copy_file_private(source, destination)?;
++    }
++    Ok(())
++}
++
++pub(super) fn source_auth_path(source: &Path) -> anyhow::Result<PathBuf> {
++    if source.is_dir() {
++        let auth = source.join("auth.json");
++        if auth.is_file() {
++            return Ok(auth);
++        }
++    }
++    if source.is_file() {
++        return Ok(source.to_path_buf());
++    }
++    anyhow::bail!("auth source not found: {}", source.display())
++}
++
++pub(super) fn copy_file_private(source: &Path, destination: &Path) -> anyhow::Result<()> {
++    if let Some(parent) = destination.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    fs::copy(source, destination).with_context(|| {
++        format!(
++            "failed to copy {} to {}",
++            source.display(),
++            destination.display()
++        )
++    })?;
++    restrict_file(destination)
++}
++
++#[cfg(unix)]
++pub(super) fn restrict_dir(path: &Path) -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++pub(super) fn restrict_dir(_path: &Path) -> anyhow::Result<()> {
++    Ok(())
++}
++
++#[cfg(unix)]
++pub(super) fn restrict_file(path: &Path) -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++pub(super) fn restrict_file(_path: &Path) -> anyhow::Result<()> {
++    Ok(())
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd/limits.rs b/codex-rs/cli/src/profile_manager_cmd/limits.rs
+new file mode 100644
+index 00000000..f58857d3
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd/limits.rs
+@@ -0,0 +1,348 @@
++use crate::profile_manager_cmd::auth::AuthSummary;
++use crate::profile_manager_cmd::auth::read_auth_summary;
++use crate::profile_manager_cmd::fs_utils::restrict_file;
++use crate::profile_manager_cmd::root::ProfilesRoot;
++use anyhow::Context;
++use codex_protocol::auth::AuthMode;
++use serde::Deserialize;
++use serde::Serialize;
++use serde_json::Value;
++use std::fs;
++use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++const NEAR_LIMIT_PERCENT: f64 = 90.0;
++const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
++const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub(super) enum LimitStatus {
++    Ok,
++    NearLimit,
++    Limited,
++    Unknown,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct LimitCache {
++    version: u32,
++    account_id: String,
++    observed_at: u64,
++    status: LimitStatus,
++    payload: Value,
++}
++
++#[derive(Debug, Clone)]
++pub(super) struct LimitReport {
++    pub(super) name: String,
++    pub(super) status: LimitStatus,
++    pub(super) five_hour_percent: Option<f64>,
++    pub(super) weekly_percent: Option<f64>,
++    source: String,
++    pub(super) detail: String,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct UsageWindow {
++    used_percent: f64,
++    window_minutes: Option<i64>,
++    is_secondary: bool,
++}
++
++pub(super) fn limit_reports(
++    root: &ProfilesRoot,
++    names: &[String],
++    refresh: bool,
++) -> anyhow::Result<Vec<LimitReport>> {
++    let names = selected_names(root, names)?;
++    let mut reports = Vec::new();
++    for name in names {
++        reports.push(limit_report(root, &name, refresh));
++    }
++    Ok(reports)
++}
++
++fn selected_names(root: &ProfilesRoot, names: &[String]) -> anyhow::Result<Vec<String>> {
++    if names.is_empty() {
++        return Ok(root
++            .list_profiles()?
++            .into_iter()
++            .map(|profile| profile.name)
++            .collect());
++    }
++    for name in names {
++        root.require_profile(name)?;
++    }
++    Ok(names.to_vec())
++}
++
++fn limit_report(root: &ProfilesRoot, name: &str, refresh: bool) -> LimitReport {
++    let Ok(auth) = read_auth_summary(&root.profile_home(name)) else {
++        return LimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++            source: "local".to_string(),
++            detail: "missing or invalid auth.json".to_string(),
++        };
++    };
++
++    if !auth.valid {
++        return LimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++            source: "local".to_string(),
++            detail: auth.message,
++        };
++    }
++
++    if !matches!(auth.mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens) {
++        return LimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Ok,
++            five_hour_percent: Some(0.0),
++            weekly_percent: Some(0.0),
++            source: "auth".to_string(),
++            detail: format!("limits not applicable for {}", auth.message),
++        };
++    }
++
++    match limit_cache_or_fetch(root, name, &auth, refresh) {
++        Ok((cache, source)) => report_from_cache(name, cache, source),
++        Err(err) => LimitReport {
++            name: name.to_string(),
++            status: LimitStatus::Unknown,
++            five_hour_percent: None,
++            weekly_percent: None,
++            source: "remote".to_string(),
++            detail: err.to_string(),
++        },
++    }
++}
++
++fn limit_cache_or_fetch(
++    root: &ProfilesRoot,
++    name: &str,
++    auth: &AuthSummary,
++    refresh: bool,
++) -> anyhow::Result<(LimitCache, String)> {
++    let cache_path = root.limit_file(name);
++    if !refresh && cache_path.is_file() {
++        let contents = fs::read_to_string(&cache_path)?;
++        let cache: LimitCache = serde_json::from_str(&contents)?;
++        if cached_account_matches_auth(&cache.account_id, auth) {
++            return Ok((cache, "cache".to_string()));
++        }
++    }
++    let cache = fetch_limits(auth)?;
++    fs::create_dir_all(root.limits_dir())?;
++    fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)?;
++    restrict_file(&cache_path)?;
++    Ok((cache, "remote".to_string()))
++}
++
++pub(super) fn cached_account_matches_auth(cached_account_id: &str, auth: &AuthSummary) -> bool {
++    auth.account_id.as_deref() == Some(cached_account_id)
++}
++
++fn fetch_limits(auth: &AuthSummary) -> anyhow::Result<LimitCache> {
++    let access_token = auth
++        .access_token
++        .as_deref()
++        .context("missing ChatGPT access token")?;
++    let account_id = auth
++        .account_id
++        .as_deref()
++        .context("missing ChatGPT account id")?;
++    let url = std::env::var("CODEX_PROFILES_LIMITS_URL")
++        .unwrap_or_else(|_| "https://chatgpt.com/backend-api/wham/usage".to_string());
++    let payload: Value = reqwest::blocking::Client::builder()
++        .timeout(Duration::from_secs(20))
++        .build()?
++        .get(url)
++        .bearer_auth(access_token)
++        .header("ChatGPT-Account-ID", account_id)
++        .header("User-Agent", "codex-profiles")
++        .send()?
++        .error_for_status()?
++        .json()?;
++    let status = classify_limit_status(&payload);
++    Ok(LimitCache {
++        version: 1,
++        account_id: account_id.to_string(),
++        observed_at: unix_now(),
++        status,
++        payload,
++    })
++}
++
++fn report_from_cache(name: &str, cache: LimitCache, source: String) -> LimitReport {
++    LimitReport {
++        name: name.to_string(),
++        status: cache.status,
++        five_hour_percent: labeled_window_percent(&cache.payload, WindowLabel::FiveHour),
++        weekly_percent: labeled_window_percent(&cache.payload, WindowLabel::Weekly),
++        source,
++        detail: format!("observed={}", cache.observed_at),
++    }
++}
++
++pub(super) fn classify_limit_status(payload: &Value) -> LimitStatus {
++    if payload
++        .pointer("/rate_limit_reached_type/type")
++        .and_then(Value::as_str)
++        .is_some_and(|value| !value.is_empty())
++    {
++        return LimitStatus::Limited;
++    }
++    let max_percent = usage_windows(payload)
++        .into_iter()
++        .map(|window| window.used_percent)
++        .fold(0.0, f64::max);
++    if max_percent >= 100.0 {
++        LimitStatus::Limited
++    } else if max_percent >= NEAR_LIMIT_PERCENT {
++        LimitStatus::NearLimit
++    } else {
++        LimitStatus::Ok
++    }
++}
++
++#[derive(Clone, Copy)]
++enum WindowLabel {
++    FiveHour,
++    Weekly,
++}
++
++fn labeled_window_percent(payload: &Value, label: WindowLabel) -> Option<f64> {
++    let windows = usage_windows(payload);
++    windows
++        .iter()
++        .find(|window| matches_window_label(window.window_minutes, label))
++        .or_else(|| fallback_window(&windows, label))
++        .map(|window| window.used_percent)
++}
++
++fn usage_windows(payload: &Value) -> Vec<UsageWindow> {
++    let mut windows = Vec::new();
++    if let Some(window) = usage_window(payload, "primary_window", /*is_secondary*/ false) {
++        windows.push(window);
++    }
++    if let Some(window) = usage_window(payload, "secondary_window", /*is_secondary*/ true) {
++        windows.push(window);
++    }
++    windows
++}
++
++fn usage_window(payload: &Value, name: &str, is_secondary: bool) -> Option<UsageWindow> {
++    let used_percent = payload
++        .pointer(&format!("/rate_limit/{name}/used_percent"))
++        .and_then(Value::as_f64)?;
++    let window_minutes = payload
++        .pointer(&format!("/rate_limit/{name}/window_minutes"))
++        .and_then(Value::as_i64);
++    Some(UsageWindow {
++        used_percent,
++        window_minutes,
++        is_secondary,
++    })
++}
++
++fn matches_window_label(window_minutes: Option<i64>, label: WindowLabel) -> bool {
++    let Some(window_minutes) = window_minutes else {
++        return false;
++    };
++    match label {
++        WindowLabel::FiveHour => is_approximate_window(window_minutes, FIVE_HOUR_WINDOW_MINUTES),
++        WindowLabel::Weekly => is_approximate_window(window_minutes, WEEKLY_WINDOW_MINUTES),
++    }
++}
++
++fn fallback_window(windows: &[UsageWindow], label: WindowLabel) -> Option<&UsageWindow> {
++    windows.iter().find(|window| match label {
++        WindowLabel::FiveHour => !window.is_secondary,
++        WindowLabel::Weekly => window.is_secondary,
++    })
++}
++
++fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
++    let minutes = minutes.max(0) as f64;
++    let expected_minutes = expected_minutes as f64;
++    minutes >= expected_minutes * 0.95 && minutes <= expected_minutes * 1.05
++}
++
++pub(super) fn best_profile(
++    root: &ProfilesRoot,
++    names: &[String],
++    refresh: bool,
++) -> anyhow::Result<LimitReport> {
++    ranked_profiles(root, names, refresh)?
++        .into_iter()
++        .next()
++        .ok_or_else(|| anyhow::anyhow!("no usable profile found"))
++}
++
++pub(super) fn ranked_profiles(
++    root: &ProfilesRoot,
++    names: &[String],
++    refresh: bool,
++) -> anyhow::Result<Vec<LimitReport>> {
++    let mut reports = limit_reports(root, names, refresh)?;
++    reports.retain(|report| matches!(report.status, LimitStatus::Ok | LimitStatus::NearLimit));
++    reports.sort_by(|left, right| {
++        limit_score(left)
++            .total_cmp(&limit_score(right))
++            .then_with(|| left.name.cmp(&right.name))
++    });
++    Ok(reports)
++}
++
++fn limit_score(report: &LimitReport) -> f64 {
++    report
++        .five_hour_percent
++        .unwrap_or(100.0)
++        .max(report.weekly_percent.unwrap_or(100.0))
++}
++
++pub(super) fn print_limits(reports: &[LimitReport]) {
++    println!(
++        "{:<24} {:<10} {:<10} {:<10} {:<8} DETAIL",
++        "PROFILE", "STATUS", "5H", "WEEKLY", "SOURCE"
++    );
++    for report in reports {
++        println!(
++            "{:<24} {:<10} {:<10} {:<10} {:<8} {}",
++            report.name,
++            status_name(report.status),
++            percent_text(report.five_hour_percent),
++            percent_text(report.weekly_percent),
++            report.source,
++            report.detail
++        );
++    }
++}
++
++pub(super) fn status_name(status: LimitStatus) -> &'static str {
++    match status {
++        LimitStatus::Ok => "ok",
++        LimitStatus::NearLimit => "near-limit",
++        LimitStatus::Limited => "limited",
++        LimitStatus::Unknown => "unknown",
++    }
++}
++
++pub(super) fn percent_text(value: Option<f64>) -> String {
++    value.map_or_else(|| "-".to_string(), |value| format!("{value:.0}%"))
++}
++
++fn unix_now() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs()
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd/project.rs b/codex-rs/cli/src/profile_manager_cmd/project.rs
+new file mode 100644
+index 00000000..6be7d1fd
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd/project.rs
+@@ -0,0 +1,104 @@
++use crate::profile_manager_cmd::root::is_valid_name;
++use std::hash::Hasher;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++
++pub(super) fn resolve_project(
++    dir: Option<&Path>,
++    explicit_id: Option<&str>,
++) -> anyhow::Result<(String, PathBuf)> {
++    let start = match dir {
++        Some(dir) => dir.to_path_buf(),
++        None => std::env::current_dir()?,
++    };
++    let root = git_root(&start)?.unwrap_or_else(|| start.canonicalize().unwrap_or(start));
++    let id = match explicit_id {
++        Some(id) => {
++            if !is_valid_name(id) {
++                anyhow::bail!("invalid project id `{id}`");
++            }
++            id.to_string()
++        }
++        None => project_id_for_root(&root),
++    };
++    Ok((id, root))
++}
++
++fn git_root(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
++    let output = Command::new("git")
++        .arg("-C")
++        .arg(dir)
++        .arg("rev-parse")
++        .arg("--show-toplevel")
++        .output();
++    match output {
++        Ok(output) if output.status.success() => {
++            let root = String::from_utf8(output.stdout)?.trim().to_string();
++            Ok(Some(PathBuf::from(root)))
++        }
++        Ok(_) => Ok(None),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err.into()),
++    }
++}
++
++pub(super) fn project_id_for_root(root: &Path) -> String {
++    let path = root.to_string_lossy();
++    let base = root
++        .file_name()
++        .and_then(|name| name.to_str())
++        .map(slugify)
++        .filter(|slug| !slug.is_empty())
++        .unwrap_or_else(|| "project".to_string());
++    format!(
++        "{base}-{:012x}",
++        stable_hash(path.as_bytes()) & 0xffffffffffff
++    )
++}
++
++fn slugify(value: &str) -> String {
++    value
++        .chars()
++        .map(|ch| {
++            if ch.is_ascii_alphanumeric() {
++                ch.to_ascii_lowercase()
++            } else {
++                '-'
++            }
++        })
++        .collect::<String>()
++        .split('-')
++        .filter(|part| !part.is_empty())
++        .collect::<Vec<_>>()
++        .join("-")
++}
++
++fn stable_hash(bytes: &[u8]) -> u64 {
++    let mut hasher = Fnv1a64::default();
++    hasher.write(bytes);
++    hasher.finish()
++}
++
++#[derive(Default)]
++struct Fnv1a64(u64);
++
++impl Hasher for Fnv1a64 {
++    fn finish(&self) -> u64 {
++        if self.0 == 0 {
++            0xcbf29ce484222325
++        } else {
++            self.0
++        }
++    }
++
++    fn write(&mut self, bytes: &[u8]) {
++        let mut value = self.finish();
++        for byte in bytes {
++            value ^= u64::from(*byte);
++            value = value.wrapping_mul(0x100000001b3);
++        }
++        self.0 = value;
++    }
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd/root.rs b/codex-rs/cli/src/profile_manager_cmd/root.rs
+new file mode 100644
+index 00000000..d665a9e6
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd/root.rs
+@@ -0,0 +1,387 @@
++use crate::profile_manager_cmd::auth::AuthSummary;
++use crate::profile_manager_cmd::auth::read_auth_summary;
++use crate::profile_manager_cmd::fs_utils::copy_file_private;
++use crate::profile_manager_cmd::fs_utils::copy_template_entries;
++use crate::profile_manager_cmd::fs_utils::restrict_dir;
++use crate::profile_manager_cmd::fs_utils::restrict_file;
++use crate::profile_manager_cmd::fs_utils::source_auth_path;
++use anyhow::Context;
++use std::collections::HashSet;
++use std::ffi::OsString;
++use std::fs;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++
++const CURRENT_FILE: &str = "current";
++const DEFAULT_TEMPLATE_HOME: &str = "template-home";
++
++#[derive(Debug, Clone)]
++pub(super) struct ProfilesRoot {
++    pub(super) root: PathBuf,
++}
++
++#[derive(Debug, Clone)]
++pub(super) struct ProfileEntry {
++    pub(super) name: String,
++    pub(super) home: PathBuf,
++    pub(super) auth: Option<AuthSummary>,
++    pub(super) sessions: usize,
++}
++
++impl ProfilesRoot {
++    pub(super) fn new(root: PathBuf) -> Self {
++        Self { root }
++    }
++
++    pub(super) fn ensure_dirs(&self) -> anyhow::Result<()> {
++        for dir in [
++            self.homes_dir(),
++            self.projects_dir(),
++            self.handoffs_dir(),
++            self.limits_dir(),
++            self.runs_dir(),
++            self.template_home(),
++        ] {
++            fs::create_dir_all(&dir)
++                .with_context(|| format!("failed to create {}", dir.display()))?;
++            restrict_dir(&dir)?;
++        }
++        Ok(())
++    }
++
++    fn homes_dir(&self) -> PathBuf {
++        self.root.join("homes")
++    }
++
++    fn projects_dir(&self) -> PathBuf {
++        self.root.join("projects")
++    }
++
++    fn handoffs_dir(&self) -> PathBuf {
++        self.root.join("handoffs")
++    }
++
++    pub(super) fn limits_dir(&self) -> PathBuf {
++        self.root.join("limits")
++    }
++
++    fn runs_dir(&self) -> PathBuf {
++        self.root.join("runs")
++    }
++
++    fn template_home(&self) -> PathBuf {
++        self.root.join(DEFAULT_TEMPLATE_HOME)
++    }
++
++    pub(super) fn current_file(&self) -> PathBuf {
++        self.root.join(CURRENT_FILE)
++    }
++
++    pub(super) fn profile_home(&self, name: &str) -> PathBuf {
++        self.homes_dir().join(name)
++    }
++
++    pub(super) fn project_home(&self, id: &str) -> PathBuf {
++        self.projects_dir().join(id)
++    }
++
++    pub(super) fn limit_file(&self, name: &str) -> PathBuf {
++        self.limits_dir().join(format!("{name}.json"))
++    }
++
++    fn validate_name(&self, name: &str) -> anyhow::Result<()> {
++        if is_valid_name(name) {
++            Ok(())
++        } else {
++            anyhow::bail!("invalid profile name `{name}`")
++        }
++    }
++
++    pub(super) fn ensure_profile_home(&self, name: &str) -> anyhow::Result<PathBuf> {
++        self.validate_name(name)?;
++        self.ensure_dirs()?;
++        let home = self.profile_home(name);
++        fs::create_dir_all(&home)
++            .with_context(|| format!("failed to create {}", home.display()))?;
++        restrict_dir(&home)?;
++        copy_template_entries(&self.template_home(), &home)?;
++        Ok(home)
++    }
++
++    pub(super) fn require_profile(&self, name: &str) -> anyhow::Result<()> {
++        self.validate_name(name)?;
++        if self.profile_home(name).join("auth.json").is_file() {
++            Ok(())
++        } else {
++            anyhow::bail!("profile `{name}` does not exist or has no auth.json")
++        }
++    }
++
++    pub(super) fn import_profile(&self, name: &str, source: &Path) -> anyhow::Result<()> {
++        let home = self.ensure_profile_home(name)?;
++        let auth_source = source_auth_path(source)?;
++        copy_file_private(&auth_source, &home.join("auth.json"))?;
++        self.set_current(name)
++    }
++
++    pub(super) fn set_current(&self, name: &str) -> anyhow::Result<()> {
++        self.validate_name(name)?;
++        self.ensure_dirs()?;
++        fs::write(self.current_file(), format!("{name}\n"))?;
++        restrict_file(&self.current_file())?;
++        Ok(())
++    }
++
++    pub(super) fn current_name(&self) -> anyhow::Result<String> {
++        let value = fs::read_to_string(self.current_file())
++            .context("no current profile selected; run `codex-profiles use NAME`")?;
++        let name = value.trim();
++        self.validate_name(name)?;
++        self.require_profile(name)?;
++        Ok(name.to_string())
++    }
++
++    pub(super) fn resolve_name(&self, name: Option<&str>) -> anyhow::Result<String> {
++        match name {
++            Some(name) => {
++                self.validate_name(name)?;
++                Ok(name.to_string())
++            }
++            None => self.current_name(),
++        }
++    }
++
++    pub(super) fn list_profiles(&self) -> anyhow::Result<Vec<ProfileEntry>> {
++        self.ensure_dirs()?;
++        let mut names = HashSet::new();
++        for entry in fs::read_dir(self.homes_dir())? {
++            let entry = entry?;
++            if entry.file_type()?.is_dir() {
++                let name = entry.file_name().to_string_lossy().to_string();
++                if is_valid_name(&name) {
++                    names.insert(name);
++                }
++            }
++        }
++
++        let mut profiles = Vec::new();
++        for name in names {
++            let home = self.profile_home(&name);
++            profiles.push(ProfileEntry {
++                name,
++                auth: read_auth_summary(&home).ok(),
++                sessions: count_session_files(&home.join("sessions"))?,
++                home,
++            });
++        }
++        profiles.sort_by(|left, right| left.name.cmp(&right.name));
++        Ok(profiles)
++    }
++
++    pub(super) fn print_profiles(&self) -> anyhow::Result<()> {
++        print_profiles(&self.list_profiles()?);
++        Ok(())
++    }
++
++    pub(super) fn remove_profile(&self, name: &str) -> anyhow::Result<()> {
++        self.validate_name(name)?;
++        let home = self.profile_home(name);
++        if home.exists() {
++            fs::remove_dir_all(&home)
++                .with_context(|| format!("failed to remove {}", home.display()))?;
++        }
++        let limit_file = self.limit_file(name);
++        if limit_file.exists() {
++            fs::remove_file(limit_file)?;
++        }
++        if fs::read_to_string(self.current_file())
++            .ok()
++            .is_some_and(|current| current.trim() == name)
++        {
++            match fs::remove_file(self.current_file()) {
++                Ok(()) => {}
++                Err(err) if err.kind() == ErrorKind::NotFound => {}
++                Err(err) => return Err(err.into()),
++            }
++        }
++        Ok(())
++    }
++
++    pub(super) fn ensure_project_home(
++        &self,
++        id: &str,
++        project_root: &Path,
++        profile_name: &str,
++    ) -> anyhow::Result<PathBuf> {
++        self.validate_name(id)?;
++        self.require_profile(profile_name)?;
++        self.ensure_dirs()?;
++        let home = self.project_home(id);
++        fs::create_dir_all(&home)
++            .with_context(|| format!("failed to create {}", home.display()))?;
++        restrict_dir(&home)?;
++        copy_template_entries(&self.template_home(), &home)?;
++        copy_file_private(
++            &self.profile_home(profile_name).join("auth.json"),
++            &home.join("auth.json"),
++        )?;
++        fs::write(
++            home.join(".codex-profile-account"),
++            format!("{profile_name}\n"),
++        )?;
++        fs::write(
++            home.join(".codex-profile-project-root"),
++            format!("{}\n", project_root.display()),
++        )?;
++        Ok(home)
++    }
++}
++
++pub(super) fn resolve_root(root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
++    if let Some(root) = root {
++        return Ok(root);
++    }
++    if let Some(root) = std::env::var_os("CODEX_PROFILES_DIR") {
++        return Ok(PathBuf::from(root));
++    }
++    let home = home_dir().context("could not resolve home directory")?;
++    Ok(default_root(home))
++}
++
++pub(super) fn default_root(home: PathBuf) -> PathBuf {
++    home.join(".config").join("codex-switch")
++}
++
++fn home_dir() -> Option<PathBuf> {
++    std::env::var_os("HOME")
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
++}
++
++pub(super) fn resolve_codex_bin(configured: Option<PathBuf>) -> PathBuf {
++    if let Some(path) = configured {
++        return path;
++    }
++    if let Ok(path) = std::env::var("CODEX_PROFILES_CODEX_BIN") {
++        return PathBuf::from(path);
++    }
++    if let Ok(current_exe) = std::env::current_exe()
++        && let Some(dir) = current_exe.parent()
++    {
++        let sibling = dir.join(exe_name("codex"));
++        if sibling.is_file() {
++            return sibling;
++        }
++    }
++    PathBuf::from("codex")
++}
++
++fn exe_name(name: &str) -> String {
++    if cfg!(windows) {
++        format!("{name}.exe")
++    } else {
++        name.to_string()
++    }
++}
++
++pub(super) fn is_valid_name(name: &str) -> bool {
++    let mut chars = name.chars();
++    let Some(first) = chars.next() else {
++        return false;
++    };
++    if !first.is_ascii_alphanumeric() {
++        return false;
++    }
++    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')) && name.len() <= 64
++}
++
++fn count_session_files(path: &Path) -> anyhow::Result<usize> {
++    if !path.exists() {
++        return Ok(0);
++    }
++    let mut count = 0;
++    let mut stack = vec![path.to_path_buf()];
++    while let Some(dir) = stack.pop() {
++        for entry in fs::read_dir(dir)? {
++            let entry = entry?;
++            let path = entry.path();
++            if entry.file_type()?.is_dir() {
++                stack.push(path);
++            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
++                count += 1;
++            }
++        }
++    }
++    Ok(count)
++}
++
++fn print_profiles(profiles: &[ProfileEntry]) {
++    println!(
++        "{:<24} {:<24} {:<28} {:<8} CODEX_HOME",
++        "PROFILE", "AUTH", "EMAIL", "SESSIONS"
++    );
++    for profile in profiles {
++        let auth = profile.auth.as_ref().map_or("missing".to_string(), |auth| {
++            if auth.valid {
++                auth.message.clone()
++            } else {
++                format!("invalid: {}", auth.message)
++            }
++        });
++        let email = profile
++            .auth
++            .as_ref()
++            .and_then(|auth| auth.email.as_deref())
++            .unwrap_or("-");
++        println!(
++            "{:<24} {:<24} {:<28} {:<8} {}",
++            profile.name,
++            auth,
++            email,
++            profile.sessions,
++            profile.home.display()
++        );
++    }
++}
++
++pub(super) fn run_codex_login(
++    codex_bin: &Path,
++    codex_home: &Path,
++    args: &[OsString],
++) -> anyhow::Result<()> {
++    fs::create_dir_all(codex_home)?;
++    restrict_dir(codex_home)?;
++    let status = Command::new(codex_bin)
++        .arg("login")
++        .args(args)
++        .env("CODEX_HOME", codex_home)
++        .status()
++        .with_context(|| format!("failed to run {}", codex_bin.display()))?;
++    if status.success() {
++        Ok(())
++    } else {
++        anyhow::bail!("codex login exited with {status}")
++    }
++}
++
++pub(super) fn run_codex(
++    codex_bin: &Path,
++    codex_home: &Path,
++    args: &[OsString],
++) -> anyhow::Result<()> {
++    fs::create_dir_all(codex_home)?;
++    restrict_dir(codex_home)?;
++    let status = Command::new(codex_bin)
++        .args(args)
++        .env("CODEX_HOME", codex_home)
++        .status()
++        .with_context(|| format!("failed to run {}", codex_bin.display()))?;
++    std::process::exit(status.code().unwrap_or(1));
++}
++
++pub(super) fn shell_quote(path: &Path) -> String {
++    let value = path.to_string_lossy();
++    format!("'{}'", value.replace('\'', "'\\''"))
++}
+diff --git a/codex-rs/cli/src/profile_manager_cmd_tests.rs b/codex-rs/cli/src/profile_manager_cmd_tests.rs
+new file mode 100644
+index 00000000..4ce04bdf
+--- /dev/null
++++ b/codex-rs/cli/src/profile_manager_cmd_tests.rs
+@@ -0,0 +1,251 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++fn write_api_auth(path: &Path, key: &str) -> anyhow::Result<()> {
++    fs::write(
++        path,
++        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{key}"}}"#),
++    )?;
++    Ok(())
++}
++
++fn write_chatgpt_auth(home: &Path, account_id: &str) -> anyhow::Result<()> {
++    fs::write(
++        home.join("auth.json"),
++        serde_json::to_vec_pretty(&serde_json::json!({
++            "auth_mode": "chatgpt",
++            "OPENAI_API_KEY": null,
++            "tokens": {
++                "id_token": "eyJhbGciOiJub25lIn0.e30.c2ln",
++                "access_token": "access-token",
++                "refresh_token": "refresh-token",
++                "account_id": account_id,
++            },
++        }))?,
++    )?;
++    Ok(())
++}
++
++fn write_limit_cache(
++    root: &ProfilesRoot,
++    name: &str,
++    five_hour_percent: f64,
++    weekly_percent: f64,
++) -> anyhow::Result<()> {
++    fs::create_dir_all(root.limits_dir())?;
++    fs::write(
++        root.limit_file(name),
++        serde_json::to_vec_pretty(&serde_json::json!({
++            "version": 1,
++            "account_id": name,
++            "observed_at": 1,
++            "status": classify_limit_status(&serde_json::json!({
++                "rate_limit": {
++                    "primary_window": {
++                        "used_percent": five_hour_percent,
++                        "window_minutes": 300,
++                    },
++                    "secondary_window": {
++                        "used_percent": weekly_percent,
++                        "window_minutes": 10080,
++                    },
++                },
++            })),
++            "payload": {
++                "rate_limit": {
++                    "primary_window": {
++                        "used_percent": five_hour_percent,
++                        "window_minutes": 300,
++                    },
++                    "secondary_window": {
++                        "used_percent": weekly_percent,
++                        "window_minutes": 10080,
++                    },
++                },
++            },
++        }))?,
++    )?;
++    Ok(())
++}
++
++#[test]
++fn import_list_and_remove_profile_stays_under_root() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let root = ProfilesRoot::new(temp.path().join("codex-profiles"));
++    let source = temp.path().join("auth.json");
++    write_api_auth(&source, "sk-test")?;
++
++    root.import_profile("main", &source)?;
++
++    assert_eq!(root.current_name()?, "main");
++    let profiles = root.list_profiles()?;
++    assert_eq!(profiles.len(), 1);
++    assert_eq!(profiles[0].name, "main");
++    assert_eq!(profiles[0].home, root.profile_home("main"));
++    assert_eq!(
++        profiles[0].auth.as_ref().map(|auth| auth.message.as_str()),
++        Some("api_key")
++    );
++    assert!(root.profile_home("main").join("auth.json").is_file());
++
++    root.remove_profile("main")?;
++
++    assert!(!root.profile_home("main").exists());
++    assert!(!root.current_file().exists());
++    Ok(())
++}
++
++#[test]
++fn project_home_copies_auth_and_records_profile_and_root() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let root = ProfilesRoot::new(temp.path().join("codex-profiles"));
++    let source = temp.path().join("auth.json");
++    write_api_auth(&source, "sk-project")?;
++    root.import_profile("main", &source)?;
++
++    let project_root = temp.path().join("workspace");
++    fs::create_dir(&project_root)?;
++    let project_home = root.ensure_project_home("workspace-123", &project_root, "main")?;
++
++    assert_eq!(
++        fs::read_to_string(project_home.join("auth.json"))?,
++        fs::read_to_string(source)?
++    );
++    assert_eq!(
++        fs::read_to_string(project_home.join(".codex-profile-account"))?,
++        "main\n"
++    );
++    assert_eq!(
++        fs::read_to_string(project_home.join(".codex-profile-project-root"))?,
++        format!("{}\n", project_root.display())
++    );
++    Ok(())
++}
++
++#[test]
++fn best_profile_launch_prepares_project_home_and_failover_candidates() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let root_dir = temp.path().join("codex-profiles");
++    let root = ProfilesRoot::new(root_dir.clone());
++    let backup_source = temp.path().join("backup-auth.json");
++    let main_source = temp.path().join("main-auth.json");
++    write_api_auth(&backup_source, "sk-backup")?;
++    write_api_auth(&main_source, "sk-main")?;
++    root.import_profile("backup", &backup_source)?;
++    root.import_profile("main", &main_source)?;
++    let project_root = temp.path().join("workspace");
++    fs::create_dir(&project_root)?;
++
++    let launch = prepare_best_profile_launch(
++        Some(root_dir),
++        Some(project_root.as_path()),
++        /*refresh_limits*/ false,
++    )?;
++
++    assert_eq!(launch.active_profile, "backup");
++    assert!(launch.project_id.starts_with("workspace-"));
++    assert_eq!(
++        fs::read_to_string(launch.codex_home.join("auth.json"))?,
++        fs::read_to_string(&backup_source)?
++    );
++    assert_eq!(launch.failover.active_profile, "backup");
++    assert_eq!(
++        launch
++            .failover
++            .candidates
++            .into_iter()
++            .map(|candidate| candidate.name)
++            .collect::<Vec<_>>(),
++        vec!["backup".to_string(), "main".to_string()]
++    );
++    Ok(())
++}
++
++#[test]
++fn limit_status_classifies_usage_payloads() {
++    let ok = serde_json::json!({
++        "rate_limit": {
++            "primary_window": {"used_percent": 10, "window_minutes": 300},
++            "secondary_window": {"used_percent": 20, "window_minutes": 10080}
++        }
++    });
++    let near = serde_json::json!({
++        "rate_limit": {
++            "primary_window": {"used_percent": 91, "window_minutes": 300},
++            "secondary_window": {"used_percent": 20, "window_minutes": 10080}
++        }
++    });
++    let limited = serde_json::json!({
++        "rate_limit_reached_type": {"type": "primary"},
++        "rate_limit": {
++            "primary_window": {"used_percent": 10, "window_minutes": 300},
++            "secondary_window": {"used_percent": 20, "window_minutes": 10080}
++        }
++    });
++
++    assert_eq!(classify_limit_status(&ok), LimitStatus::Ok);
++    assert_eq!(classify_limit_status(&near), LimitStatus::NearLimit);
++    assert_eq!(classify_limit_status(&limited), LimitStatus::Limited);
++}
++
++#[test]
++fn best_profile_penalizes_weekly_usage() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let root = ProfilesRoot::new(temp.path().join("codex-profiles"));
++    let weekly_hot = root.ensure_profile_home("weekly-hot")?;
++    let balanced = root.ensure_profile_home("balanced")?;
++    write_chatgpt_auth(&weekly_hot, "weekly-hot")?;
++    write_chatgpt_auth(&balanced, "balanced")?;
++    write_limit_cache(
++        &root,
++        "weekly-hot",
++        /*five_hour_percent*/ 20.0,
++        /*weekly_percent*/ 95.0,
++    )?;
++    write_limit_cache(
++        &root, "balanced", /*five_hour_percent*/ 50.0, /*weekly_percent*/ 50.0,
++    )?;
++
++    let best = best_profile(&root, &[], /*refresh*/ false)?;
++
++    assert_eq!(best.name, "balanced");
++    assert_eq!(best.five_hour_percent, Some(50.0));
++    assert_eq!(best.weekly_percent, Some(50.0));
++    Ok(())
++}
++
++#[test]
++fn cached_limit_account_must_match_current_auth() {
++    let auth = auth::AuthSummary {
++        mode: codex_protocol::auth::AuthMode::Chatgpt,
++        email: Some("user@example.com".to_string()),
++        access_token: Some("access-token".to_string()),
++        account_id: Some("current-account".to_string()),
++        valid: true,
++        message: "chatgpt".to_string(),
++    };
++
++    assert!(limits::cached_account_matches_auth(
++        "current-account",
++        &auth
++    ));
++    assert!(!limits::cached_account_matches_auth("old-account", &auth));
++}
++
++#[test]
++fn project_ids_are_stable_and_include_slug() {
++    let first = project_id_for_root(Path::new("/tmp/Agent Coordinator"));
++    let second = project_id_for_root(Path::new("/tmp/Agent Coordinator"));
++
++    assert_eq!(first, second);
++    assert!(first.starts_with("agent-coordinator-"));
++}
++
++#[test]
++fn default_root_matches_legacy_switcher_location() {
++    assert_eq!(
++        default_root(PathBuf::from("/home/alice")),
++        PathBuf::from("/home/alice/.config/codex-switch")
++    );
++}
+diff --git a/codex-rs/cli/src/profile_pool_cmd.rs b/codex-rs/cli/src/profile_pool_cmd.rs
+new file mode 100644
+index 00000000..d11ed957
+--- /dev/null
++++ b/codex-rs/cli/src/profile_pool_cmd.rs
+@@ -0,0 +1,472 @@
++use anyhow::Context;
++use clap::Args;
++use clap::Parser;
++use codex_config::ProfileV2Name;
++use codex_config::types::AuthCredentialsStoreMode;
++use codex_core::config::ConfigBuilder;
++use codex_core::config::LoaderOverrides;
++use codex_core::config::find_codex_home;
++use codex_core::config::resolve_profile_v2_config_path;
++use codex_login::AuthDotJson;
++use codex_login::load_auth_dot_json;
++use codex_protocol::auth::AuthMode;
++use serde::Deserialize;
++use serde::Serialize;
++use std::collections::HashSet;
++use std::path::Path;
++use std::path::PathBuf;
++use std::str::FromStr;
++use toml::Value as TomlValue;
++
++#[cfg(test)]
++#[path = "profile_pool_cmd_tests.rs"]
++mod tests;
++
++/// [experimental] Manage a portable pool of Codex account profiles.
++#[derive(Debug, Parser)]
++pub(crate) struct ProfilePoolCli {
++    #[command(subcommand)]
++    subcommand: ProfilePoolSubcommand,
++}
++
++#[derive(Debug, clap::Subcommand)]
++enum ProfilePoolSubcommand {
++    /// Show configured pool entries and local health.
++    Status(ProfilePoolCheckArgs),
++
++    /// Validate configured pool entries and fail if any entry is unusable.
++    Test(ProfilePoolCheckArgs),
++}
++
++#[derive(Debug, Args)]
++struct ProfilePoolCheckArgs {
++    /// Path to the pool TOML file. Defaults to $CODEX_HOME/pool.toml.
++    #[arg(long = "pool", value_name = "FILE")]
++    pool: Option<PathBuf>,
++
++    /// Print machine-readable JSON.
++    #[arg(long = "json", default_value_t = false)]
++    json: bool,
++
++    /// Error out when an entry config.toml contains fields that are not recognized by this version of Codex.
++    #[arg(long = "strict-config", default_value_t = false)]
++    strict_config: bool,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PoolToml {
++    #[serde(default)]
++    default_strategy: Option<String>,
++    #[serde(default)]
++    fallback_cooldown_seconds: Option<u64>,
++    profiles: Vec<PoolProfileToml>,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PoolProfileToml {
++    id: String,
++    codex_home: PathBuf,
++    #[serde(default)]
++    config_profile: Option<String>,
++    #[serde(default)]
++    priority: i64,
++    #[serde(default)]
++    cooldown_seconds: Option<u64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PoolProfile {
++    id: String,
++    codex_home: PathBuf,
++    config_profile: Option<ProfileV2Name>,
++    priority: i64,
++    cooldown_seconds: Option<u64>,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct PoolStatusOutput {
++    pool: String,
++    default_strategy: Option<String>,
++    fallback_cooldown_seconds: Option<u64>,
++    profiles: Vec<ProfileStatus>,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct ProfileStatus {
++    id: String,
++    codex_home: String,
++    config_profile: Option<String>,
++    priority: i64,
++    cooldown_seconds: Option<u64>,
++    status: HealthStatus,
++    config: CheckResult,
++    auth: CheckResult,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "snake_case")]
++enum HealthStatus {
++    Ok,
++    Fail,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct CheckResult {
++    status: HealthStatus,
++    message: String,
++}
++
++pub(crate) async fn run(
++    cli: ProfilePoolCli,
++    cli_overrides: Vec<(String, TomlValue)>,
++) -> anyhow::Result<()> {
++    match cli.subcommand {
++        ProfilePoolSubcommand::Status(args) => {
++            let output = collect_pool_status(args.pool, args.strict_config, cli_overrides).await?;
++            print_pool_status(&output, args.json)?;
++        }
++        ProfilePoolSubcommand::Test(args) => {
++            let output = collect_pool_status(args.pool, args.strict_config, cli_overrides).await?;
++            print_pool_status(&output, args.json)?;
++            if output
++                .profiles
++                .iter()
++                .any(|profile| profile.status == HealthStatus::Fail)
++            {
++                anyhow::bail!("one or more pool profiles failed validation");
++            }
++        }
++    }
++
++    Ok(())
++}
++
++async fn collect_pool_status(
++    pool_path: Option<PathBuf>,
++    strict_config: bool,
++    cli_overrides: Vec<(String, TomlValue)>,
++) -> anyhow::Result<PoolStatusOutput> {
++    let pool_path = resolve_pool_path(pool_path)?;
++    let pool = load_pool_config(&pool_path)?;
++    let statuses = check_profiles(&pool.profiles, strict_config, cli_overrides).await;
++
++    Ok(PoolStatusOutput {
++        pool: pool_path.display().to_string(),
++        default_strategy: pool.default_strategy,
++        fallback_cooldown_seconds: pool.fallback_cooldown_seconds,
++        profiles: statuses,
++    })
++}
++
++fn resolve_pool_path(pool_path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
++    match pool_path {
++        Some(path) => Ok(path),
++        None => Ok(find_codex_home()?.join("pool.toml").to_path_buf()),
++    }
++}
++
++fn load_pool_config(path: &Path) -> anyhow::Result<PoolConfig> {
++    let contents = std::fs::read_to_string(path)
++        .with_context(|| format!("failed to read pool config {}", path.display()))?;
++    let raw: PoolToml = toml::from_str(&contents)
++        .with_context(|| format!("failed to parse pool config {}", path.display()))?;
++    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
++    PoolConfig::from_toml(raw, base_dir)
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct PoolConfig {
++    default_strategy: Option<String>,
++    fallback_cooldown_seconds: Option<u64>,
++    profiles: Vec<PoolProfile>,
++}
++
++impl PoolConfig {
++    fn from_toml(raw: PoolToml, base_dir: &Path) -> anyhow::Result<Self> {
++        if raw.profiles.is_empty() {
++            anyhow::bail!("pool config must include at least one [[profiles]] entry");
++        }
++
++        let mut ids = HashSet::new();
++        let mut profiles = Vec::with_capacity(raw.profiles.len());
++        for profile in raw.profiles {
++            if profile.id.trim().is_empty() {
++                anyhow::bail!("pool profile id must not be empty");
++            }
++            if !ids.insert(profile.id.clone()) {
++                anyhow::bail!("duplicate pool profile id `{}`", profile.id);
++            }
++            let config_profile = profile
++                .config_profile
++                .as_deref()
++                .map(ProfileV2Name::from_str)
++                .transpose()
++                .with_context(|| {
++                    format!("invalid config_profile for pool profile `{}`", profile.id)
++                })?;
++            profiles.push(PoolProfile {
++                id: profile.id,
++                codex_home: resolve_pool_relative_path(base_dir, profile.codex_home),
++                config_profile,
++                priority: profile.priority,
++                cooldown_seconds: profile.cooldown_seconds,
++            });
++        }
++
++        profiles.sort_by(|left, right| {
++            right
++                .priority
++                .cmp(&left.priority)
++                .then_with(|| left.id.cmp(&right.id))
++        });
++
++        Ok(Self {
++            default_strategy: raw.default_strategy,
++            fallback_cooldown_seconds: raw.fallback_cooldown_seconds,
++            profiles,
++        })
++    }
++}
++
++fn resolve_pool_relative_path(base_dir: &Path, path: PathBuf) -> PathBuf {
++    if path.is_absolute() {
++        path
++    } else {
++        base_dir.join(path)
++    }
++}
++
++async fn check_profiles(
++    profiles: &[PoolProfile],
++    strict_config: bool,
++    cli_overrides: Vec<(String, TomlValue)>,
++) -> Vec<ProfileStatus> {
++    let mut statuses = Vec::with_capacity(profiles.len());
++    for profile in profiles {
++        statuses.push(check_profile(profile, strict_config, cli_overrides.clone()).await);
++    }
++    statuses
++}
++
++async fn check_profile(
++    profile: &PoolProfile,
++    strict_config: bool,
++    cli_overrides: Vec<(String, TomlValue)>,
++) -> ProfileStatus {
++    let config_profile = profile
++        .config_profile
++        .as_ref()
++        .map(|profile| profile.as_str().to_string());
++    let (config, auth) = match load_profile_config(profile, strict_config, cli_overrides).await {
++        Ok(config) => {
++            let auth = check_auth(&config);
++            (
++                CheckResult {
++                    status: HealthStatus::Ok,
++                    message: "ok".to_string(),
++                },
++                auth,
++            )
++        }
++        Err(err) => (
++            CheckResult {
++                status: HealthStatus::Fail,
++                message: err.to_string(),
++            },
++            CheckResult {
++                status: HealthStatus::Fail,
++                message: "skipped because config did not load".to_string(),
++            },
++        ),
++    };
++    let status = if config.status == HealthStatus::Ok && auth.status == HealthStatus::Ok {
++        HealthStatus::Ok
++    } else {
++        HealthStatus::Fail
++    };
++
++    ProfileStatus {
++        id: profile.id.clone(),
++        codex_home: profile.codex_home.display().to_string(),
++        config_profile,
++        priority: profile.priority,
++        cooldown_seconds: profile.cooldown_seconds,
++        status,
++        config,
++        auth,
++    }
++}
++
++async fn load_profile_config(
++    profile: &PoolProfile,
++    strict_config: bool,
++    cli_overrides: Vec<(String, TomlValue)>,
++) -> anyhow::Result<codex_core::config::Config> {
++    let mut loader_overrides = LoaderOverrides::default();
++    if let Some(config_profile) = profile.config_profile.as_ref() {
++        loader_overrides.user_config_path = Some(resolve_profile_v2_config_path(
++            &profile.codex_home,
++            config_profile,
++        ));
++        loader_overrides.user_config_profile = Some(config_profile.clone());
++    }
++
++    Ok(ConfigBuilder::default()
++        .codex_home(profile.codex_home.clone())
++        .cli_overrides(cli_overrides)
++        .loader_overrides(loader_overrides)
++        .strict_config(strict_config)
++        .build()
++        .await?)
++}
++
++fn check_auth(config: &codex_core::config::Config) -> CheckResult {
++    match load_auth_dot_json(
++        &config.codex_home,
++        config.cli_auth_credentials_store_mode,
++        config.auth_keyring_backend_kind(),
++    ) {
++        Ok(Some(auth)) => match stored_auth_mode(&auth) {
++            Ok(mode) => CheckResult {
++                status: HealthStatus::Ok,
++                message: auth_mode_name(mode).to_string(),
++            },
++            Err(message) => CheckResult {
++                status: HealthStatus::Fail,
++                message,
++            },
++        },
++        Ok(None) => CheckResult {
++            status: HealthStatus::Fail,
++            message: format!(
++                "no stored credentials found in {} auth storage",
++                auth_store_name(config.cli_auth_credentials_store_mode)
++            ),
++        },
++        Err(err) => CheckResult {
++            status: HealthStatus::Fail,
++            message: format!("failed to load auth storage: {err}"),
++        },
++    }
++}
++
++fn stored_auth_mode(auth: &AuthDotJson) -> Result<AuthMode, String> {
++    let mode = resolved_auth_mode(auth);
++    match mode {
++        AuthMode::ApiKey => {
++            require_non_empty(
++                auth.openai_api_key.as_deref(),
++                "API key auth is missing a key",
++            )?;
++        }
++        AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
++            let Some(tokens) = auth.tokens.as_ref() else {
++                return Err("ChatGPT auth is missing tokens".to_string());
++            };
++            require_non_empty(
++                Some(&tokens.access_token),
++                "ChatGPT auth is missing an access token",
++            )?;
++            require_non_empty(
++                Some(&tokens.refresh_token),
++                "ChatGPT auth is missing a refresh token",
++            )?;
++        }
++        AuthMode::AgentIdentity => {
++            let Some(agent_identity) = auth.agent_identity.as_ref() else {
++                return Err("agent identity auth is missing auth material".to_string());
++            };
++            if !agent_identity.has_auth_material() {
++                return Err("agent identity auth material is empty".to_string());
++            }
++        }
++        AuthMode::PersonalAccessToken => {
++            require_non_empty(
++                auth.personal_access_token.as_deref(),
++                "personal access token auth is missing a token",
++            )?;
++        }
++        AuthMode::BedrockApiKey => {
++            if auth.bedrock_api_key.is_none() {
++                return Err("Bedrock API key auth is missing a key".to_string());
++            }
++        }
++    }
++    Ok(mode)
++}
++
++fn resolved_auth_mode(auth: &AuthDotJson) -> AuthMode {
++    if let Some(mode) = auth.auth_mode {
++        return mode;
++    }
++    if auth.personal_access_token.is_some() {
++        return AuthMode::PersonalAccessToken;
++    }
++    if auth.bedrock_api_key.is_some() {
++        return AuthMode::BedrockApiKey;
++    }
++    if auth.openai_api_key.is_some() {
++        return AuthMode::ApiKey;
++    }
++    AuthMode::Chatgpt
++}
++
++fn require_non_empty(value: Option<&str>, message: &str) -> Result<(), String> {
++    match value {
++        Some(value) if !value.trim().is_empty() => Ok(()),
++        Some(_) | None => Err(message.to_string()),
++    }
++}
++
++fn auth_mode_name(mode: AuthMode) -> &'static str {
++    match mode {
++        AuthMode::ApiKey => "api_key",
++        AuthMode::Chatgpt => "chatgpt",
++        AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
++        AuthMode::AgentIdentity => "agent_identity",
++        AuthMode::PersonalAccessToken => "personal_access_token",
++        AuthMode::BedrockApiKey => "bedrock_api_key",
++    }
++}
++
++fn auth_store_name(mode: AuthCredentialsStoreMode) -> &'static str {
++    match mode {
++        AuthCredentialsStoreMode::File => "file",
++        AuthCredentialsStoreMode::Keyring => "keyring",
++        AuthCredentialsStoreMode::Auto => "auto",
++        AuthCredentialsStoreMode::Ephemeral => "ephemeral",
++    }
++}
++
++fn print_pool_status(output: &PoolStatusOutput, json: bool) -> anyhow::Result<()> {
++    if json {
++        println!("{}", serde_json::to_string_pretty(output)?);
++        return Ok(());
++    }
++
++    println!("Profile pool: {}", output.pool);
++    for profile in &output.profiles {
++        let status = match profile.status {
++            HealthStatus::Ok => "ok",
++            HealthStatus::Fail => "fail",
++        };
++        let config_profile = profile.config_profile.as_deref().unwrap_or("-");
++        println!(
++            "{} {status} priority={} home={} config_profile={} auth={}",
++            profile.id, profile.priority, profile.codex_home, config_profile, profile.auth.message,
++        );
++        if profile.config.status == HealthStatus::Fail {
++            println!("  config: {}", profile.config.message);
++        }
++        if profile.auth.status == HealthStatus::Fail {
++            println!("  auth: {}", profile.auth.message);
++        }
++    }
++
++    Ok(())
++}
+diff --git a/codex-rs/cli/src/profile_pool_cmd_tests.rs b/codex-rs/cli/src/profile_pool_cmd_tests.rs
+new file mode 100644
+index 00000000..381ed801
+--- /dev/null
++++ b/codex-rs/cli/src/profile_pool_cmd_tests.rs
+@@ -0,0 +1,132 @@
++use super::*;
++use codex_login::AuthDotJson;
++use pretty_assertions::assert_eq;
++use tempfile::tempdir;
++
++#[test]
++fn pool_config_resolves_relative_homes_and_sorts_by_priority() -> anyhow::Result<()> {
++    let raw: PoolToml = toml::from_str(
++        r#"
++default_strategy = "priority"
++fallback_cooldown_seconds = 3600
++
++[[profiles]]
++id = "backup"
++codex_home = "backup-home"
++priority = 5
++
++[[profiles]]
++id = "main"
++codex_home = "main-home"
++config_profile = "work"
++priority = 10
++cooldown_seconds = 120
++"#,
++    )?;
++    let config = PoolConfig::from_toml(raw, Path::new("/tmp/pool"))?;
++
++    assert_eq!(
++        config.profiles,
++        vec![
++            PoolProfile {
++                id: "main".to_string(),
++                codex_home: PathBuf::from("/tmp/pool/main-home"),
++                config_profile: Some(ProfileV2Name::from_str("work")?),
++                priority: 10,
++                cooldown_seconds: Some(120),
++            },
++            PoolProfile {
++                id: "backup".to_string(),
++                codex_home: PathBuf::from("/tmp/pool/backup-home"),
++                config_profile: None,
++                priority: 5,
++                cooldown_seconds: None,
++            },
++        ]
++    );
++
++    Ok(())
++}
++
++#[test]
++fn pool_config_rejects_duplicate_ids() -> anyhow::Result<()> {
++    let raw: PoolToml = toml::from_str(
++        r#"
++[[profiles]]
++id = "main"
++codex_home = "/tmp/main"
++
++[[profiles]]
++id = "main"
++codex_home = "/tmp/other"
++"#,
++    )?;
++    let err = PoolConfig::from_toml(raw, Path::new("/tmp"))
++        .expect_err("duplicate ids should be rejected");
++
++    assert_eq!(err.to_string(), "duplicate pool profile id `main`");
++    Ok(())
++}
++
++#[test]
++fn stored_auth_mode_accepts_api_key_auth() {
++    let auth = AuthDotJson {
++        auth_mode: Some(AuthMode::ApiKey),
++        openai_api_key: Some("sk-test".to_string()),
++        tokens: None,
++        last_refresh: None,
++        agent_identity: None,
++        personal_access_token: None,
++        bedrock_api_key: None,
++    };
++
++    assert_eq!(stored_auth_mode(&auth), Ok(AuthMode::ApiKey));
++}
++
++#[test]
++fn stored_auth_mode_rejects_empty_api_key_auth() {
++    let auth = AuthDotJson {
++        auth_mode: Some(AuthMode::ApiKey),
++        openai_api_key: Some(" ".to_string()),
++        tokens: None,
++        last_refresh: None,
++        agent_identity: None,
++        personal_access_token: None,
++        bedrock_api_key: None,
++    };
++
++    assert_eq!(
++        stored_auth_mode(&auth),
++        Err("API key auth is missing a key".to_string())
++    );
++}
++
++#[tokio::test]
++async fn collect_pool_status_checks_file_auth() -> anyhow::Result<()> {
++    let temp = tempdir()?;
++    let pool_path = temp.path().join("pool.toml");
++    let codex_home = temp.path().join("home");
++    std::fs::create_dir(&codex_home)?;
++    std::fs::write(
++        codex_home.join("auth.json"),
++        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test"}"#,
++    )?;
++    std::fs::write(
++        &pool_path,
++        format!(
++            r#"
++[[profiles]]
++id = "main"
++codex_home = "{}"
++"#,
++            codex_home.display()
++        ),
++    )?;
++
++    let output = collect_pool_status(Some(pool_path), false, Vec::new()).await?;
++
++    assert_eq!(output.profiles.len(), 1);
++    assert_eq!(output.profiles[0].status, HealthStatus::Ok);
++    assert_eq!(output.profiles[0].auth.message, "api_key");
++    Ok(())
++}
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index d90d0101..761276b8 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -605,6 +605,18 @@ pub enum ThreadStoreConfig {
+ }
+ 
+ /// Application configuration loaded from disk and merged with overrides.
++#[derive(Debug, Clone, PartialEq)]
++pub struct ProfileAuthCandidateConfig {
++    pub name: String,
++    pub auth_file: PathBuf,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct ProfileAuthFailoverConfig {
++    pub active_profile: String,
++    pub candidates: Vec<ProfileAuthCandidateConfig>,
++}
++
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Config {
+     /// Provenance for how this [`Config`] was derived (merged layers + enforced
+@@ -907,6 +919,9 @@ pub struct Config {
+     /// This is a runtime-only knob populated from invocation overrides, not from config files.
+     pub bypass_hook_trust: bool,
+ 
++    /// Runtime-only profile auth failover settings populated by `codex --best`.
++    pub profile_auth_failover: Option<ProfileAuthFailoverConfig>,
++
+     /// Optional URI-based file opener. If set, citations to files in the model
+     /// output will be hyperlinked using the specified URI scheme.
+     pub file_opener: UriBasedFileOpener,
+@@ -2395,6 +2410,7 @@ pub struct ConfigOverrides {
+     pub tools_web_search_request: Option<bool>,
+     pub ephemeral: Option<bool>,
+     pub bypass_hook_trust: Option<bool>,
++    pub profile_auth_failover: Option<ProfileAuthFailoverConfig>,
+     /// Additional directories that should be treated as writable roots for this session.
+     pub additional_writable_roots: Vec<PathBuf>,
+     /// Explicit absolute runtime workspace roots for this session. When set,
+@@ -2983,6 +2999,7 @@ impl Config {
+             tools_web_search_request: override_tools_web_search_request,
+             ephemeral,
+             bypass_hook_trust,
++            profile_auth_failover,
+             additional_writable_roots,
+             workspace_roots: workspace_roots_override,
+         } = overrides;
+@@ -3857,6 +3874,7 @@ impl Config {
+             ephemeral: ephemeral.unwrap_or_default(),
+             extra_config: None,
+             bypass_hook_trust,
++            profile_auth_failover,
+             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
+             codex_self_exe,
+             codex_linux_sandbox_exe,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 809fa920..13b6de7b 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -210,6 +210,7 @@ mod input_queue;
+ mod mcp;
+ mod mcp_runtime;
+ pub(crate) mod multi_agents;
++pub(crate) mod profile_auth_failover;
+ mod review;
+ mod rollout_budget;
+ mod rollout_reconstruction;
+diff --git a/codex-rs/core/src/session/profile_auth_failover.rs b/codex-rs/core/src/session/profile_auth_failover.rs
+new file mode 100644
+index 00000000..c3238cdd
+--- /dev/null
++++ b/codex-rs/core/src/session/profile_auth_failover.rs
+@@ -0,0 +1,110 @@
++use crate::config::ProfileAuthFailoverConfig;
++use codex_login::AuthManager;
++use std::collections::HashSet;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Mutex;
++
++#[derive(Debug, Clone)]
++struct ProfileAuthCandidate {
++    name: String,
++    auth_file: PathBuf,
++}
++
++#[derive(Debug)]
++struct ProfileAuthFailoverState {
++    active_profile: String,
++    limited_profiles: HashSet<String>,
++}
++
++#[derive(Debug)]
++pub(crate) struct ProfileAuthFailover {
++    codex_home: PathBuf,
++    candidates: Vec<ProfileAuthCandidate>,
++    state: Mutex<ProfileAuthFailoverState>,
++}
++
++impl ProfileAuthFailover {
++    pub(crate) fn new(codex_home: PathBuf, config: ProfileAuthFailoverConfig) -> Option<Self> {
++        if config.candidates.len() < 2 {
++            return None;
++        }
++        let candidates = config
++            .candidates
++            .into_iter()
++            .map(|candidate| ProfileAuthCandidate {
++                name: candidate.name,
++                auth_file: candidate.auth_file,
++            })
++            .collect();
++        Some(Self {
++            codex_home,
++            candidates,
++            state: Mutex::new(ProfileAuthFailoverState {
++                active_profile: config.active_profile,
++                limited_profiles: HashSet::new(),
++            }),
++        })
++    }
++
++    pub(crate) async fn switch_after_usage_limit(
++        &self,
++        auth_manager: &AuthManager,
++    ) -> anyhow::Result<Option<String>> {
++        let Some(next) = self.next_candidate_after_marking_active_limited()? else {
++            return Ok(None);
++        };
++
++        copy_auth_file(&next.auth_file, &self.codex_home.join("auth.json"))?;
++        auth_manager.reload().await;
++
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("profile auth failover state lock poisoned"))?;
++        state.active_profile.clone_from(&next.name);
++        Ok(Some(next.name))
++    }
++
++    fn next_candidate_after_marking_active_limited(
++        &self,
++    ) -> anyhow::Result<Option<ProfileAuthCandidate>> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("profile auth failover state lock poisoned"))?;
++        let active_profile = state.active_profile.clone();
++        state.limited_profiles.insert(active_profile);
++
++        Ok(self
++            .candidates
++            .iter()
++            .find(|candidate| !state.limited_profiles.contains(&candidate.name))
++            .cloned())
++    }
++}
++
++fn copy_auth_file(source: &Path, destination: &Path) -> anyhow::Result<()> {
++    if let Some(parent) = destination.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    fs::copy(source, destination)?;
++    restrict_file(destination)
++}
++
++#[cfg(unix)]
++fn restrict_file(path: &Path) -> anyhow::Result<()> {
++    use std::os::unix::fs::PermissionsExt;
++    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn restrict_file(_path: &Path) -> anyhow::Result<()> {
++    Ok(())
++}
++
++#[cfg(test)]
++#[path = "profile_auth_failover_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/session/profile_auth_failover_tests.rs b/codex-rs/core/src/session/profile_auth_failover_tests.rs
+new file mode 100644
+index 00000000..4f3137fc
+--- /dev/null
++++ b/codex-rs/core/src/session/profile_auth_failover_tests.rs
+@@ -0,0 +1,85 @@
++use super::*;
++use crate::config::ProfileAuthCandidateConfig;
++use codex_config::types::AuthCredentialsStoreMode;
++use codex_config::types::AuthKeyringBackendKind;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++
++fn write_api_auth(path: &Path, key: &str) -> anyhow::Result<()> {
++    fs::write(
++        path,
++        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{key}"}}"#),
++    )?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn switch_after_usage_limit_copies_next_auth_and_reloads_manager() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let codex_home = temp.path().join("project-home");
++    let profiles = temp.path().join("profiles");
++    let main = profiles.join("main");
++    let backup = profiles.join("backup");
++    fs::create_dir_all(&codex_home)?;
++    fs::create_dir_all(&main)?;
++    fs::create_dir_all(&backup)?;
++    write_api_auth(&codex_home.join("auth.json"), "sk-main")?;
++    write_api_auth(&main.join("auth.json"), "sk-main")?;
++    write_api_auth(&backup.join("auth.json"), "sk-backup")?;
++    let auth_manager = AuthManager::shared(
++        codex_home.clone(),
++        /*enable_codex_api_key_env*/ false,
++        AuthCredentialsStoreMode::File,
++        /*forced_chatgpt_workspace_id*/ None,
++        /*chatgpt_base_url*/ None,
++        AuthKeyringBackendKind::default(),
++        /*auth_route_config*/ None,
++    )
++    .await;
++    assert_eq!(
++        auth_manager
++            .auth()
++            .await
++            .and_then(|auth| auth.api_key().map(str::to_string)),
++        Some("sk-main".to_string())
++    );
++
++    let failover = ProfileAuthFailover::new(
++        codex_home.clone(),
++        ProfileAuthFailoverConfig {
++            active_profile: "main".to_string(),
++            candidates: vec![
++                ProfileAuthCandidateConfig {
++                    name: "main".to_string(),
++                    auth_file: main.join("auth.json"),
++                },
++                ProfileAuthCandidateConfig {
++                    name: "backup".to_string(),
++                    auth_file: backup.join("auth.json"),
++                },
++            ],
++        },
++    )
++    .expect("two candidates should enable failover");
++
++    assert_eq!(
++        failover.switch_after_usage_limit(&auth_manager).await?,
++        Some("backup".to_string())
++    );
++    assert_eq!(
++        auth_manager
++            .auth()
++            .await
++            .and_then(|auth| auth.api_key().map(str::to_string)),
++        Some("sk-backup".to_string())
++    );
++    assert_eq!(
++        fs::read_to_string(codex_home.join("auth.json"))?,
++        fs::read_to_string(backup.join("auth.json"))?
++    );
++    assert_eq!(
++        failover.switch_after_usage_limit(&auth_manager).await?,
++        None
++    );
++    Ok(())
++}
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 5e7046b1..d883a8c9 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1041,6 +1041,18 @@ impl Session {
+                 }).await;
+             }
+ 
++            let failover_codex_home = config.codex_home.to_path_buf();
++            let profile_auth_failover = config
++                .profile_auth_failover
++                .clone()
++                .and_then(|failover_config| {
++                    super::profile_auth_failover::ProfileAuthFailover::new(
++                        failover_codex_home,
++                        failover_config,
++                    )
++                })
++                .map(Arc::new);
++
+             let services = SessionServices {
+                 // Initialize the MCP connection manager with an uninitialized
+                 // instance. It will be replaced with one created via
+@@ -1065,6 +1077,7 @@ impl Session {
+                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                 exec_policy,
+                 auth_manager: Arc::clone(&auth_manager),
++                profile_auth_failover,
+                 session_telemetry,
+                 models_manager: Arc::clone(&models_manager),
+                 tool_approvals: Mutex::new(ApprovalStore::default()),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index ece9d446..d9583a26 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5400,6 +5400,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+         exec_policy,
+         auth_manager: auth_manager.clone(),
++        profile_auth_failover: None,
+         session_telemetry: session_telemetry.clone(),
+         models_manager: Arc::clone(&models_manager),
+         tool_approvals: Mutex::new(ApprovalStore::default()),
+@@ -7526,6 +7527,7 @@ where
+         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+         exec_policy,
+         auth_manager: Arc::clone(&auth_manager),
++        profile_auth_failover: None,
+         session_telemetry: session_telemetry.clone(),
+         models_manager: Arc::clone(&models_manager),
+         tool_approvals: Mutex::new(ApprovalStore::default()),
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index f16b5250..ddc048af 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -1139,6 +1139,38 @@ async fn run_sampling_request(
+                 if let Some(rate_limits) = rate_limits {
+                     sess.update_rate_limits(&turn_context, *rate_limits).await;
+                 }
++                if let Some(profile_auth_failover) = sess.services.profile_auth_failover.as_ref() {
++                    match profile_auth_failover
++                        .switch_after_usage_limit(&sess.services.auth_manager)
++                        .await
++                    {
++                        Ok(Some(profile)) => {
++                            *client_session = sess.services.model_client.new_session();
++                            sess.send_event(
++                                &turn_context,
++                                EventMsg::Warning(WarningEvent {
++                                    message: format!(
++                                        "Usage limit reached; switched to profile `{profile}` and retrying."
++                                    ),
++                                }),
++                            )
++                            .await;
++                            continue;
++                        }
++                        Ok(None) => {}
++                        Err(err) => {
++                            sess.send_event(
++                                &turn_context,
++                                EventMsg::Warning(WarningEvent {
++                                    message: format!(
++                                        "Usage limit reached, but profile failover failed: {err:#}"
++                                    ),
++                                }),
++                            )
++                            .await;
++                        }
++                    }
++                }
+                 return Err(CodexErr::UsageLimitReached(e));
+             }
+             Err(err) => err,
+diff --git a/codex-rs/core/src/state/service.rs b/codex-rs/core/src/state/service.rs
+index a611b948..a7c618d8 100644
+--- a/codex-rs/core/src/state/service.rs
++++ b/codex-rs/core/src/state/service.rs
+@@ -16,6 +16,7 @@ use crate::guardian::GuardianRejection;
+ use crate::guardian::GuardianRejectionCircuitBreaker;
+ use crate::mcp::McpManager;
+ use crate::session::McpRuntimeSnapshot;
++use crate::session::profile_auth_failover::ProfileAuthFailover;
+ use crate::tools::code_mode::CodeModeService;
+ use crate::tools::handlers::ToolSearchHandlerCache;
+ use crate::tools::network_approval::NetworkApprovalService;
+@@ -66,6 +67,7 @@ pub(crate) struct SessionServices {
+     pub(crate) show_raw_agent_reasoning: bool,
+     pub(crate) exec_policy: Arc<ExecPolicyManager>,
+     pub(crate) auth_manager: Arc<AuthManager>,
++    pub(crate) profile_auth_failover: Option<Arc<ProfileAuthFailover>>,
+     pub(crate) models_manager: SharedModelsManager,
+     pub(crate) session_telemetry: SessionTelemetry,
+     pub(crate) tool_approvals: Mutex<ApprovalStore>,
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index 7ea8461b..ee39420c 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -444,6 +444,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
+         tools_web_search_request: None,
+         ephemeral: ephemeral.then_some(true),
+         bypass_hook_trust: bypass_hook_trust.then_some(true),
++        profile_auth_failover: None,
+         additional_writable_roots: add_dir,
+     };
+ 
+diff --git a/codex-rs/tui/src/cli.rs b/codex-rs/tui/src/cli.rs
+index 13ddffb1..e8ee0d7b 100644
+--- a/codex-rs/tui/src/cli.rs
++++ b/codex-rs/tui/src/cli.rs
+@@ -1,9 +1,17 @@
++use crate::legacy_core::config::ProfileAuthFailoverConfig;
+ use clap::Args;
+ use clap::FromArgMatches;
+ use clap::Parser;
+ use codex_utils_cli::ApprovalModeCliArg;
+ use codex_utils_cli::CliConfigOverrides;
+ use codex_utils_cli::SharedCliOptions;
++use std::path::PathBuf;
++
++#[derive(Clone, Debug)]
++pub struct ProfileAuthLaunch {
++    pub codex_home: PathBuf,
++    pub failover: ProfileAuthFailoverConfig,
++}
+ 
+ #[derive(Parser, Clone, Debug)]
+ #[command(version)]
+@@ -71,6 +79,13 @@ pub struct Cli {
+     #[arg(long = "no-alt-screen", default_value_t = false)]
+     pub no_alt_screen: bool,
+ 
++    /// Select the best managed account profile for this project and enable usage-limit failover.
++    #[arg(long = "best", default_value_t = false)]
++    pub best_profile: bool,
++
++    #[clap(skip)]
++    pub profile_auth_launch: Option<ProfileAuthLaunch>,
++
+     #[clap(skip)]
+     pub config_overrides: CliConfigOverrides,
+ }
+diff --git a/codex-rs/tui/src/ide_context/ipc.rs b/codex-rs/tui/src/ide_context/ipc.rs
+index 57942d93..60e71c4a 100644
+--- a/codex-rs/tui/src/ide_context/ipc.rs
++++ b/codex-rs/tui/src/ide_context/ipc.rs
+@@ -900,10 +900,13 @@ mod tests {
+     #[cfg(unix)]
+     #[test]
+     fn fetch_ide_context_uses_unregistered_request_route() {
++        use std::os::unix::fs::PermissionsExt;
+         use std::os::unix::net::UnixListener;
+         use std::thread;
+ 
+         let tempdir = tempfile::tempdir().expect("tempdir");
++        std::fs::set_permissions(tempdir.path(), std::fs::Permissions::from_mode(0o700))
++            .expect("set secure permissions");
+         let socket_path = tempdir.path().join("codex-ipc.sock");
+         let listener = UnixListener::bind(&socket_path).expect("bind socket");
+ 
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 96f442a8..41cdb624 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -218,6 +218,7 @@ use crate::startup_hooks_review::load_startup_hooks_review_entry;
+ use crate::startup_hooks_review::maybe_run_startup_hooks_review;
+ use crate::tui::Tui;
+ pub use cli::Cli;
++pub use cli::ProfileAuthLaunch;
+ use codex_arg0::Arg0DispatchPaths;
+ pub use markdown_render::render_markdown_text;
+ pub use public_widgets::composer_input::ComposerAction;
+@@ -890,11 +891,17 @@ pub async fn run_main(
+ 
+     // we load config.toml here to determine project state.
+     #[allow(clippy::print_stderr)]
+-    let codex_home = match find_codex_home() {
+-        Ok(codex_home) => codex_home.to_path_buf(),
+-        Err(err) => {
+-            eprintln!("Error finding codex home: {err}");
+-            std::process::exit(1);
++    let profile_auth_launch = cli.profile_auth_launch.clone();
++    let codex_home = if let Some(launch) = profile_auth_launch.as_ref() {
++        launch.codex_home.clone()
++    } else {
++        match find_codex_home() {
++            Ok(codex_home) => codex_home.to_path_buf(),
++            #[allow(clippy::print_stderr)]
++            Err(err) => {
++                eprintln!("Error finding codex home: {err}");
++                std::process::exit(1);
++            }
+         }
+     };
+ 
+@@ -1057,11 +1064,13 @@ pub async fn run_main(
+         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
+         show_raw_agent_reasoning: cli.oss.then_some(true),
+         bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
++        profile_auth_failover: profile_auth_launch.map(|launch| launch.failover),
+         additional_writable_roots: additional_dirs,
+         ..Default::default()
+     };
+ 
+     let mut config = load_config_or_exit(
++        Some(codex_home.clone()),
+         cli_kv_overrides.clone(),
+         overrides.clone(),
+         loader_overrides.clone(),
+@@ -1117,6 +1126,7 @@ pub async fn run_main(
+             {
+                 Ok(true) => {
+                     config = load_config_or_exit(
++                        Some(codex_home.clone()),
+                         cli_kv_overrides.clone(),
+                         overrides.clone(),
+                         loader_overrides.clone(),
+@@ -1456,6 +1466,7 @@ async fn run_ratatui_app(
+             || (show_login_screen && !uses_remote_workspace)
+         {
+             load_config_or_exit(
++                Some(initial_config.codex_home.to_path_buf()),
+                 cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+@@ -1660,6 +1671,7 @@ async fn run_ratatui_app(
+     let mut config = match &session_selection {
+         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
+             load_config_or_exit_with_fallback_cwd(
++                Some(config.codex_home.to_path_buf()),
+                 cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+@@ -1671,6 +1683,7 @@ async fn run_ratatui_app(
+         }
+         resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
+             load_config_or_exit(
++                Some(config.codex_home.to_path_buf()),
+                 cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+@@ -1898,6 +1911,7 @@ async fn get_login_status(
+ }
+ 
+ async fn load_config_or_exit(
++    codex_home: Option<PathBuf>,
+     cli_kv_overrides: Vec<(String, toml::Value)>,
+     overrides: ConfigOverrides,
+     loader_overrides: LoaderOverrides,
+@@ -1905,6 +1919,7 @@ async fn load_config_or_exit(
+     strict_config: bool,
+ ) -> Config {
+     load_config_or_exit_with_fallback_cwd(
++        codex_home,
+         cli_kv_overrides,
+         overrides,
+         loader_overrides,
+@@ -1916,6 +1931,7 @@ async fn load_config_or_exit(
+ }
+ 
+ async fn load_config_or_exit_with_fallback_cwd(
++    codex_home: Option<PathBuf>,
+     cli_kv_overrides: Vec<(String, toml::Value)>,
+     overrides: ConfigOverrides,
+     loader_overrides: LoaderOverrides,
+@@ -1923,17 +1939,19 @@ async fn load_config_or_exit_with_fallback_cwd(
+     strict_config: bool,
+     fallback_cwd: Option<PathBuf>,
+ ) -> Config {
+-    #[allow(clippy::print_stderr)]
+-    match ConfigBuilder::default()
++    let mut builder = ConfigBuilder::default()
+         .cli_overrides(cli_kv_overrides)
+         .harness_overrides(overrides)
+         .loader_overrides(loader_overrides)
+         .strict_config(strict_config)
+         .cloud_config_bundle(cloud_config_bundle)
+-        .fallback_cwd(fallback_cwd)
+-        .build()
+-        .await
+-    {
++        .fallback_cwd(fallback_cwd);
++    if let Some(codex_home) = codex_home {
++        builder = builder.codex_home(codex_home);
++    }
++
++    #[allow(clippy::print_stderr)]
++    match builder.build().await {
+         Ok(config) => config,
+         Err(err) => {
+             eprintln!("Error loading configuration: {err}");
+-- 
+2.51.0
+

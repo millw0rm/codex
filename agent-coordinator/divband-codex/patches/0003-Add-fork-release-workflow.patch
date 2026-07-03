@@ -1,0 +1,105 @@
+From 2b00b28862da2348956fb699e36a2400333ede63 Mon Sep 17 00:00:00 2001
+From: your name <you@exampl.ecom>
+Date: Thu, 2 Jul 2026 22:27:22 +0330
+Subject: [PATCH 3/7] Add fork release workflow
+
+---
+ .github/workflows/fork-release.yml | 86 ++++++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+ create mode 100644 .github/workflows/fork-release.yml
+
+diff --git a/.github/workflows/fork-release.yml b/.github/workflows/fork-release.yml
+new file mode 100644
+index 00000000..c7aab29e
+--- /dev/null
++++ b/.github/workflows/fork-release.yml
+@@ -0,0 +1,86 @@
++name: fork-release
++
++on:
++  workflow_dispatch:
++    inputs:
++      tag_name:
++        description: "Release tag to create or update, for example fork-v0.1.0"
++        required: true
++        type: string
++      prerelease:
++        description: "Mark the release as a prerelease"
++        required: true
++        default: true
++        type: boolean
++  push:
++    tags:
++      - "fork-v*"
++
++permissions:
++  contents: write
++
++concurrency:
++  group: fork-release-${{ github.ref_name }}
++  cancel-in-progress: false
++
++jobs:
++  linux-x64:
++    name: Build Linux x64 release artifacts
++    runs-on: ubuntu-24.04
++    timeout-minutes: 60
++    defaults:
++      run:
++        shell: bash
++    env:
++      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
++      TARGET: x86_64-unknown-linux-gnu
++
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++        with:
++          persist-credentials: false
++
++      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
++
++      - name: Build Codex binaries
++        working-directory: codex-rs
++        run: |
++          set -euo pipefail
++          cargo build --release --bin codex --bin codex-profiles
++
++      - name: Package release artifacts
++        run: |
++          set -euo pipefail
++          tag_name="${{ github.event.inputs.tag_name || github.ref_name }}"
++          package_name="codex-${tag_name}-${TARGET}"
++          package_dir="dist/${package_name}"
++
++          mkdir -p "${package_dir}"
++          cp codex-rs/target/release/codex "${package_dir}/codex"
++          cp codex-rs/target/release/codex-profiles "${package_dir}/codex-profiles"
++          chmod +x "${package_dir}/codex" "${package_dir}/codex-profiles"
++
++          tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
++          (cd dist && sha256sum "${package_name}.tar.gz" > "${package_name}.tar.gz.sha256")
++
++      - name: Create or update GitHub Release
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          set -euo pipefail
++          tag_name="${{ github.event.inputs.tag_name || github.ref_name }}"
++          prerelease="${{ github.event.inputs.prerelease || 'true' }}"
++          release_flags=()
++          if [[ "${prerelease}" == "true" ]]; then
++            release_flags+=(--prerelease)
++          fi
++
++          if ! gh release view "${tag_name}" >/dev/null 2>&1; then
++            gh release create "${tag_name}" \
++              --target "${GITHUB_SHA}" \
++              --title "${tag_name}" \
++              --notes "Automated Codex fork release for ${GITHUB_SHA}." \
++              "${release_flags[@]}"
++          fi
++
++          gh release upload "${tag_name}" dist/*.tar.gz dist/*.sha256 --clobber
+-- 
+2.51.0
+
