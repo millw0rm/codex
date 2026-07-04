@@ -51,15 +51,15 @@ impl ProfilesRoot {
         Ok(())
     }
 
-    fn homes_dir(&self) -> PathBuf {
+    pub(super) fn homes_dir(&self) -> PathBuf {
         self.root.join("homes")
     }
 
-    fn projects_dir(&self) -> PathBuf {
+    pub(super) fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
     }
 
-    fn handoffs_dir(&self) -> PathBuf {
+    pub(super) fn handoffs_dir(&self) -> PathBuf {
         self.root.join("handoffs")
     }
 

@@ -219,6 +219,7 @@ use crate::startup_hooks_review::load_startup_hooks_review_entry;
 use crate::startup_hooks_review::maybe_run_startup_hooks_review;
 use crate::tui::Tui;
 pub use cli::Cli;
+pub use cli::ManagedCodexHomeLaunch;
 pub use cli::ProfileAuthLaunch;
 use codex_arg0::Arg0DispatchPaths;
 pub use markdown_render::render_markdown_text;
@@ -896,6 +897,7 @@ pub async fn run_main(
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
     let profile_auth_launch = cli.profile_auth_launch.clone();
+    let managed_codex_home = cli.managed_codex_home.clone();
     let base_codex_home = match find_codex_home() {
         Ok(codex_home) => codex_home.to_path_buf(),
         #[allow(clippy::print_stderr)]
@@ -905,7 +907,7 @@ pub async fn run_main(
         }
     };
     let project_dir = cli.project_dir.as_deref().or(cli.cwd.as_deref());
-    let project_launch = if profile_auth_launch.is_none() {
+    let project_launch = if profile_auth_launch.is_none() && managed_codex_home.is_none() {
         cli.project
             .as_deref()
             .map(|project_id| prepare_project_home(&base_codex_home, project_id, project_dir))
@@ -914,6 +916,8 @@ pub async fn run_main(
         None
     };
     let codex_home = if let Some(launch) = profile_auth_launch.as_ref() {
+        launch.codex_home.clone()
+    } else if let Some(launch) = managed_codex_home.as_ref() {
         launch.codex_home.clone()
     } else {
         project_launch

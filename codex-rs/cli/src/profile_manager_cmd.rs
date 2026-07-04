@@ -28,6 +28,9 @@ use root::run_codex;
 use root::run_codex_login;
 use root::shell_quote;
 use std::ffi::OsString;
+use std::fs;
+use std::io::BufRead;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -39,8 +42,6 @@ use limits::classify_limit_status;
 use project::project_id_for_root;
 #[cfg(test)]
 use root::default_root;
-#[cfg(test)]
-use std::fs;
 
 #[cfg(test)]
 #[path = "profile_manager_cmd_tests.rs"]
@@ -215,6 +216,182 @@ pub struct BestProfileLaunch {
     pub active_profile: String,
     pub project_id: String,
     pub failover: ProfileAuthFailoverConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedSessionHomeKind {
+    Profile {
+        name: String,
+    },
+    Project {
+        id: String,
+        project_root: Option<PathBuf>,
+    },
+    Handoff {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedSessionHome {
+    pub codex_home: PathBuf,
+    pub kind: ManagedSessionHomeKind,
+}
+
+impl ManagedSessionHome {
+    pub fn label(&self) -> String {
+        match &self.kind {
+            ManagedSessionHomeKind::Profile { name } => format!("profile `{name}`"),
+            ManagedSessionHomeKind::Project { id, .. } => format!("project `{id}`"),
+            ManagedSessionHomeKind::Handoff { id } => format!("handoff `{id}`"),
+        }
+    }
+}
+
+pub fn resolve_managed_session_home(
+    root_dir: Option<PathBuf>,
+    target: &str,
+) -> anyhow::Result<Option<ManagedSessionHome>> {
+    if target.is_empty() {
+        return Ok(None);
+    }
+    let root = ProfilesRoot::new(resolve_root(root_dir)?);
+    let mut matches = Vec::new();
+
+    for entry in read_valid_home_dirs(&root.homes_dir())? {
+        let name = entry.name;
+        let codex_home = entry.path;
+        if home_has_resume_target(&codex_home, target)? {
+            matches.push(ManagedSessionHome {
+                codex_home,
+                kind: ManagedSessionHomeKind::Profile { name },
+            });
+        }
+    }
+
+    for entry in read_valid_home_dirs(&root.projects_dir())? {
+        let id = entry.name;
+        let codex_home = entry.path;
+        if home_has_resume_target(&codex_home, target)? {
+            let project_root = read_project_root(&codex_home)?;
+            matches.push(ManagedSessionHome {
+                codex_home,
+                kind: ManagedSessionHomeKind::Project { id, project_root },
+            });
+        }
+    }
+
+    for entry in read_valid_home_dirs(&root.handoffs_dir())? {
+        let id = entry.name;
+        let codex_home = entry.path;
+        if home_has_resume_target(&codex_home, target)? {
+            matches.push(ManagedSessionHome {
+                codex_home,
+                kind: ManagedSessionHomeKind::Handoff { id },
+            });
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => {
+            let details = matches
+                .iter()
+                .map(|home| format!("{} at {}", home.label(), home.codex_home.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("resume target `{target}` exists in multiple managed homes: {details}")
+        }
+    }
+}
+
+struct HomeDirEntry {
+    name: String,
+    path: PathBuf,
+}
+
+fn read_valid_home_dirs(root: &Path) -> anyhow::Result<Vec<HomeDirEntry>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut homes = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if root::is_valid_name(&name) {
+            homes.push(HomeDirEntry {
+                name,
+                path: entry.path(),
+            });
+        }
+    }
+    Ok(homes)
+}
+
+fn home_has_resume_target(home: &Path, target: &str) -> anyhow::Result<bool> {
+    let sessions = home.join("sessions");
+    let mut stack = vec![sessions];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(target))
+                || file_contains(&path, target)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn file_contains(path: &Path, target: &str) -> anyhow::Result<bool> {
+    let file = fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        if line?.contains(target) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_project_root(home: &Path) -> anyhow::Result<Option<PathBuf>> {
+    for marker in [".codex-profile-project-root", ".codex-project-root"] {
+        match fs::read_to_string(home.join(marker)) {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Ok(Some(PathBuf::from(trimmed)));
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(None)
 }
 
 pub fn prepare_best_profile_launch(

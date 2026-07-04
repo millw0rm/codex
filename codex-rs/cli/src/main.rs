@@ -31,6 +31,7 @@ use codex_state::memories_db_path;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
+use codex_tui::ManagedCodexHomeLaunch;
 use codex_tui::ProfileAuthLaunch;
 use codex_tui::UpdateAction;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -1308,6 +1309,8 @@ async fn cli_main(
                     "resume --best",
                 )?;
                 configure_best_profile_launch(&mut interactive).await?;
+            } else {
+                configure_managed_resume_home(&mut interactive)?;
             }
             let exit_info = run_interactive_tui(
                 interactive,
@@ -1884,8 +1887,45 @@ async fn load_exec_server_config(
 
 async fn configure_best_profile_launch(interactive: &mut TuiCli) -> anyhow::Result<()> {
     eprintln!("Refreshing profile usage limits...");
-    let project_dir = interactive.cwd.clone();
-    let project_id = interactive.project.clone();
+    let resume_owner = interactive
+        .resume_session_id
+        .as_deref()
+        .map(|target| codex_cli::profile_manager_cmd::resolve_managed_session_home(None, target))
+        .transpose()?
+        .flatten();
+    if let Some(owner) = resume_owner.as_ref()
+        && !matches!(
+            &owner.kind,
+            codex_cli::profile_manager_cmd::ManagedSessionHomeKind::Project { .. }
+        )
+    {
+        eprintln!(
+            "Using managed {} for resume target; CODEX_HOME={}",
+            owner.label(),
+            owner.codex_home.display()
+        );
+        interactive.managed_codex_home = Some(ManagedCodexHomeLaunch {
+            codex_home: owner.codex_home.clone(),
+        });
+        return Ok(());
+    }
+
+    let owner_project = resume_owner.as_ref().and_then(|owner| match &owner.kind {
+        codex_cli::profile_manager_cmd::ManagedSessionHomeKind::Project { id, project_root } => {
+            project_root
+                .as_ref()
+                .map(|project_root| (id.clone(), project_root.clone()))
+        }
+        _ => None,
+    });
+    let project_dir = owner_project
+        .as_ref()
+        .map(|(_, project_root)| project_root.clone())
+        .or_else(|| interactive.cwd.clone());
+    let project_id = owner_project
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .or_else(|| interactive.project.clone());
     let launch = tokio::task::spawn_blocking(move || {
         codex_cli::profile_manager_cmd::prepare_best_profile_launch(
             /*root_dir*/ None,
@@ -1904,6 +1944,29 @@ async fn configure_best_profile_launch(interactive: &mut TuiCli) -> anyhow::Resu
     interactive.profile_auth_launch = Some(ProfileAuthLaunch {
         codex_home: launch.codex_home,
         failover: launch.failover,
+    });
+    Ok(())
+}
+
+fn configure_managed_resume_home(interactive: &mut TuiCli) -> anyhow::Result<()> {
+    if interactive.project.is_some() || interactive.managed_codex_home.is_some() {
+        return Ok(());
+    }
+    let Some(target) = interactive.resume_session_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(owner) = codex_cli::profile_manager_cmd::resolve_managed_session_home(None, target)?
+    else {
+        return Ok(());
+    };
+    eprintln!(
+        "Resolved resume target '{}' to managed {}; CODEX_HOME={}",
+        target,
+        owner.label(),
+        owner.codex_home.display()
+    );
+    interactive.managed_codex_home = Some(ManagedCodexHomeLaunch {
+        codex_home: owner.codex_home,
     });
     Ok(())
 }

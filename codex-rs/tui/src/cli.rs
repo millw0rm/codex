@@ -13,6 +13,11 @@ pub struct ProfileAuthLaunch {
     pub failover: ProfileAuthFailoverConfig,
 }
 
+#[derive(Clone, Debug)]
+pub struct ManagedCodexHomeLaunch {
+    pub codex_home: PathBuf,
+}
+
 #[derive(Parser, Clone, Debug)]
 #[command(version)]
 pub struct Cli {
@@ -85,6 +90,9 @@ pub struct Cli {
 
     #[clap(skip)]
     pub profile_auth_launch: Option<ProfileAuthLaunch>,
+
+    #[clap(skip)]
+    pub managed_codex_home: Option<ManagedCodexHomeLaunch>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,

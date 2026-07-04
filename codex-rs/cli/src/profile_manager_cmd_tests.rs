@@ -124,6 +124,39 @@ fn project_home_copies_auth_and_records_profile_and_root() -> anyhow::Result<()>
 }
 
 #[test]
+fn resolve_managed_session_home_finds_project_session_by_id() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let root_dir = temp.path().join("codex-profiles");
+    let root = ProfilesRoot::new(root_dir.clone());
+    let source = temp.path().join("auth.json");
+    write_api_auth(&source, "sk-project")?;
+    root.import_profile("main", &source)?;
+
+    let project_root = temp.path().join("workspace");
+    fs::create_dir(&project_root)?;
+    let project_home = root.ensure_project_home("workspace-123", &project_root, "main")?;
+    let session_id = "123e4567-e89b-12d3-a456-426614174000";
+    let session_dir = project_home.join("sessions/2026/07/04");
+    fs::create_dir_all(&session_dir)?;
+    fs::write(
+        session_dir.join(format!("rollout-2026-07-04T00-00-00-{session_id}.jsonl")),
+        format!(r#"{{"type":"session_meta","payload":{{"session_id":"{session_id}"}}}}"#),
+    )?;
+
+    let owner = resolve_managed_session_home(Some(root_dir), session_id)?.expect("session owner");
+
+    assert_eq!(owner.codex_home, project_home);
+    assert_eq!(
+        owner.kind,
+        ManagedSessionHomeKind::Project {
+            id: "workspace-123".to_string(),
+            project_root: Some(project_root),
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn best_profile_launch_prepares_project_home_and_failover_candidates() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let root_dir = temp.path().join("codex-profiles");
