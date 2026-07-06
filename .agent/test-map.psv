@@ -1,0 +1,6 @@
+change_type|selector|checks|notes
+docs|default|scripts/local/check-change.sh|Validate coordinator contract and migration package metadata only.
+feature|default|scripts/local/check-change.sh|Use lightweight validation before explicit Rust build/test selection.
+fix|default|scripts/local/check-change.sh|Use lightweight validation before explicit Rust build/test selection.
+toolchain|rebuild|python3 agent-coordinator/divband-codex/run.py --skip-apply --agents off --jobs 1 --test-profile focused --skip-copy-artifacts|Explicit rebuild validation path for changed Codex overlay or upstream sync.
+toolchain|patch-only|python3 agent-coordinator/divband-codex/run.py --force --agents off --skip-build --test-profile none|Apply overlay without Rust build when inspecting patch drift.
